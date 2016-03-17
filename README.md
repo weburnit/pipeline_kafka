@@ -55,10 +55,10 @@ Assuming the existence of a stream named `topic_stream` that a continuous view i
 (1 row)
 ```
 
-This will launch a background worker that will read from the Kafka topic `kafka_topic`, and use `COPY` to write the messages to `topic_stream`. You can specifiy the format that `COPY` should expect, as well as a delimiter:
+This will launch a background worker that will read from the Kafka topic `kafka_topic`, and use `COPY` to write the messages to `topic_stream`. You can specifiy the format that `COPY` should expect, as well as a delimiter, quote and escape character:
 
 ```
-=# SELECT kafka_consume_begin('kafka_topic', 'topic_stream', format := 'text', delimiter := 'x');
+=# SELECT kafka_consume_begin('kafka_topic', 'topic_stream', format := 'text', delimiter := E'\t');
  kafka_consume_begin
 ------------------
  success
