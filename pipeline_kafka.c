@@ -322,7 +322,13 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 			if (isnull)
 				offset = RD_KAFKA_OFFSET_END;
 			else
-				offset = DatumGetInt64(d);
+			{
+				/*
+				 * Add one so that we start consuming from the message after the one we consumed
+				 * most recently.
+				 */
+				offset = DatumGetInt64(d) + 1;
+			}
 		}
 		else
 			offset = start_offset;
