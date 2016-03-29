@@ -313,7 +313,7 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 		d = slot_getattr(slot, OFFSETS_ATTR_PARTITION, &isnull);
 		partition = DatumGetInt32(d);
 
-		if(partition > consumer->num_partitions)
+		if (partition > consumer->num_partitions)
 			elog(ERROR, "invalid partition id: %d", partition);
 
 		if (start_offset == RD_KAFKA_OFFSET_NULL)
@@ -480,6 +480,7 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 		Datum d;
 		bool isnull;
 		int partition;
+		int offset;
 		HeapTuple modified;
 
 		ExecStoreTuple(tup, slot, InvalidBuffer, false);
@@ -488,6 +489,13 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 
 		/* we only want to update the offsets we're responsible for */
 		if (partition % consumer->parallelism != partition_group)
+			continue;
+
+		d = slot_getattr(slot, OFFSETS_ATTR_OFFSET, &isnull);
+		offset = DatumGetInt64(d);
+
+		/* No need to update offset if its unchanged */
+		if (offset == consumer->offsets[partition])
 			continue;
 
 		MemSet(nulls, false, sizeof(nulls));
@@ -641,6 +649,7 @@ kafka_consume_main(Datum arg)
 	int valid_brokers = 0;
 	int i;
 	int my_partitions = 0;
+	MemoryContext work_ctx;
 
 	if (!found)
 		elog(ERROR, "kafka consumer %d not found", id);
@@ -722,6 +731,10 @@ kafka_consume_main(Datum arg)
 		goto done;
 	}
 
+	work_ctx = AllocSetContextCreate(TopMemoryContext, "KafkaConsumerContext",
+				ALLOCSET_DEFAULT_MINSIZE,
+				ALLOCSET_DEFAULT_INITSIZE,
+				ALLOCSET_DEFAULT_MAXSIZE);
 	messages = palloc0(sizeof(rd_kafka_message_t *) * consumer.batch_size);
 
 	/*
@@ -733,8 +746,12 @@ kafka_consume_main(Datum arg)
 		int i;
 		int messages_buffered = 0;
 		int partition;
-		StringInfoData buf;
-		bool xact = false;
+		StringInfo buf;
+
+		MemoryContextSwitchTo(work_ctx);
+		MemoryContextReset(work_ctx);
+
+		buf = makeStringInfo();
 
 		for (partition = 0; partition < consumer.num_partitions; partition++)
 		{
@@ -747,38 +764,52 @@ kafka_consume_main(Datum arg)
 			if (num_consumed <= 0)
 				continue;
 
-			if (!xact)
-			{
-				StartTransactionCommand();
-				xact = true;
-			}
-
-			initStringInfo(&buf);
 			for (i = 0; i < num_consumed; i++)
 			{
-				if (messages[i]->payload != NULL)
+				Assert(messages[i]);
+
+				if (messages[i]->err != RD_KAFKA_RESP_ERR_NO_ERROR)
 				{
-					appendBinaryStringInfo(&buf, messages[i]->payload, messages[i]->len);
-					if (buf.len > 0 && buf.data[buf.len - 1] != '\n')
-						appendStringInfoChar(&buf, '\n');
+					/* Ignore partition EOF internal error */
+					if (messages[i]->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
+						elog(LOG, "[kafka consumer] %s <- %s consumer error %s",
+								consumer.rel->relname, consumer.topic, rd_kafka_err2str(messages[i]->err));
+
+					continue;
+				}
+
+				if (messages[i]->len > 0)
+				{
+					appendBinaryStringInfo(buf, messages[i]->payload, messages[i]->len);
+
+					/* COPY expects a newline after each tuple, so add one if missing. */
+					if (buf->data[buf->len - 1] != '\n')
+						appendStringInfoChar(buf, '\n');
+
 					messages_buffered++;
 				}
+
+				Assert(messages[i]->offset >= consumer.offsets[partition]);
+
 				consumer.offsets[partition] = messages[i]->offset;
 				rd_kafka_message_destroy(messages[i]);
+				messages[i] = NULL;
 			}
 		}
 
-		if (!xact)
+		if (messages_buffered == 0)
 		{
-			pg_usleep(1 * 1000);
+			pg_usleep(1000);
 			continue;
 		}
+
+		StartTransactionCommand();
 
 		/* we don't want to die in the event of any errors */
 		PG_TRY();
 		{
 			if (messages_buffered)
-				execute_copy(copy, &buf);
+				execute_copy(copy, buf);
 		}
 		PG_CATCH();
 		{
@@ -788,15 +819,13 @@ kafka_consume_main(Datum arg)
 			FlushErrorState();
 
 			AbortCurrentTransaction();
-			xact = false;
 		}
 		PG_END_TRY();
 
-		if (!xact)
+		if (!IsTransactionState())
 			StartTransactionCommand();
 
-		if (messages_buffered)
-			save_consumer_state(&consumer, proc->partition_group);
+		save_consumer_state(&consumer, proc->partition_group);
 
 		CommitTransactionCommand();
 	}
