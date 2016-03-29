@@ -814,7 +814,7 @@ kafka_consume_main(Datum arg)
 		PG_CATCH();
 		{
 			elog(LOG, "[kafka consumer] %s <- %s failed to process batch, dropped %d message%s:",
-					consumer.rel->relname, consumer.topic, (int) num_consumed, (num_consumed == 1 ? "" : "s"));
+					consumer.rel->relname, consumer.topic, messages_buffered, (messages_buffered == 1 ? "" : "s"));
 			EmitErrorReport();
 			FlushErrorState();
 
