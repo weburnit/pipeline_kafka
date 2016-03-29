@@ -494,6 +494,8 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 		d = slot_getattr(slot, OFFSETS_ATTR_OFFSET, &isnull);
 		offset = DatumGetInt64(d);
 
+		updated[partition] = true;
+
 		/* No need to update offset if its unchanged */
 		if (offset == consumer->offsets[partition])
 			continue;
@@ -503,7 +505,6 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 
 		values[OFFSETS_ATTR_OFFSET - 1] = Int64GetDatum(consumer->offsets[partition]);
 		replace[OFFSETS_ATTR_OFFSET - 1] = true;
-		updated[partition] = true;
 
 		modified = heap_modify_tuple(tup, RelationGetDescr(offsets), values, nulls, replace);
 		simple_heap_update(offsets, &modified->t_self, modified);
