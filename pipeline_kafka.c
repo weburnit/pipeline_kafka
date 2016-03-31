@@ -1437,7 +1437,7 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 	if (!TRIGGER_FIRED_AFTER(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("kafka_emit_tuple: must be called after update")));
+				 errmsg("kafka_emit_tuple: must be called after insert or update")));
 
 	tup = trigdata->tg_trigtuple;
 	desc = RelationGetDescr(trigdata->tg_relation);
