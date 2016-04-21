@@ -16,9 +16,9 @@ CREATE TABLE pipeline_kafka_consumers (
 ) WITH OIDS;
 
 CREATE TABLE pipeline_kafka_offsets (
-	consumer_id oid     NOT NULL,
-	partition   integer NOT NULL,
-	"offset"    bigint  NOT NULL
+  consumer_id oid     NOT NULL,
+  partition   integer NOT NULL,
+  "offset"    bigint  NOT NULL
 );
 -- Brokers added with kafka_add_broker
 CREATE TABLE pipeline_kafka_brokers (
