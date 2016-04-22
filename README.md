@@ -45,6 +45,8 @@ CREATE EXTENSION
 (1 row)
 ```
 
+### Consuming Messages
+
 Assuming the existence of a stream named `topic_stream` that a continuous view is reading from, you can now begin ingesting data from Kafka (**note**: only static streams can consume data from Kafka):
 
 ```
@@ -100,6 +102,37 @@ All existing consumers can be started or stopped at once by not passing any argu
 ------------------
  success
 (1 row)
+```
+
+### Producing Messages
+
+You can also produce messages into Kafka topics.
+
+```
+=# SELECT kafka_produce_message('kafka_topic', 'hello world!');
+ kafka_produce_message
+------------------
+ success
+(1 row
+```
+
+You can also specify a parition key or an explicit partition to produce the message into.
+
+
+```
+=# SELECT kafka_produce_message('kafka_topic', 'hello world!', partition := 2);
+ kafka_produce_message
+------------------
+ success
+(1 row
+```
+
+pipeline_kafka also comes with a trigger function that can be used to produced JSON serialized tuples into Kafka topics. The trigger function can be only be used by `AFTER INSERT|UPDATE` and `FOR EACH ROW` triggers.
+```
+=# CREATE TRIGGER tg 
+     AFTER UPDATE ON t FOR EACH ROW WHEN (x = 1)
+     EXECUTE PROCEDURE kafka_emit_tuple('kafka_topic');
+CREATE TRIGGER
 ```
 
 ## Documentation
