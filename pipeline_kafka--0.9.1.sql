@@ -3,8 +3,8 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pipeline_kafka" to load this file. \quit
 
--- Consumers added with kafka_consume_begin
-CREATE TABLE pipeline_kafka_consumers (
+-- Consumers added with pipeline_kafka.consume_begin
+CREATE TABLE pipeline_kafka.consumers (
   relation    text    NOT NULL,
   topic       text    NOT NULL,
   format      text    NOT NULL,
@@ -15,17 +15,18 @@ CREATE TABLE pipeline_kafka_consumers (
   parallelism integer NOT NULL
 ) WITH OIDS;
 
-CREATE TABLE pipeline_kafka_offsets (
+CREATE TABLE pipeline_kafka.offsets (
   consumer_id oid     NOT NULL,
   partition   integer NOT NULL,
   "offset"    bigint  NOT NULL
 );
--- Brokers added with kafka_add_broker
-CREATE TABLE pipeline_kafka_brokers (
+
+-- Brokers added with pipeline_kafka.add_broker
+CREATE TABLE pipeline_kafka.brokers (
 	host text PRIMARY KEY
 ) WITH OIDS;
 
-CREATE FUNCTION kafka_consume_begin (
+CREATE FUNCTION pipeline_kafka.consume_begin (
   topic        text,
   relation     text,
   format       text    DEFAULT 'text',
@@ -40,7 +41,7 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_begin_tr'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_consume_end (
+CREATE FUNCTION pipeline_kafka.consume_end (
   topic    text,
   relation text
 )
@@ -48,17 +49,17 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_end_tr'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_consume_begin()
+CREATE FUNCTION pipeline_kafka.consume_begin()
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_begin_all'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_consume_end()
+CREATE FUNCTION pipeline_kafka.consume_end()
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_end_all'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_produce_message (
+CREATE FUNCTION pipeline_kafka.produce_message (
   topic     text,
   message   bytea,
   partition integer DEFAULT NULL,
@@ -68,19 +69,19 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_produce_msg'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_emit_tuple()
+CREATE FUNCTION pipeline_kafka.emit_tuple()
 RETURNS trigger
 AS 'MODULE_PATHNAME', 'kafka_emit_tuple'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_add_broker (
+CREATE FUNCTION pipeline_kafka.add_broker (
   host text
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_add_broker'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_remove_broker (
+CREATE FUNCTION pipeline_kafka.remove_broker (
   host text
 )
 RETURNS text

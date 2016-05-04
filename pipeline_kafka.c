@@ -54,8 +54,9 @@ PG_MODULE_MAGIC;
 
 #define KAFKA_CONSUME_MAIN "kafka_consume_main"
 #define PIPELINE_KAFKA_LIB "pipeline_kafka"
+#define PIPELINE_KAFKA_SCHEMA "pipeline_kafka"
 
-#define CONSUMER_RELATION "pipeline_kafka_consumers"
+#define CONSUMER_RELATION "consumers"
 #define CONSUMER_RELATION_NATTS		9
 #define CONSUMER_ATTR_RELATION 		1
 #define CONSUMER_ATTR_TOPIC			2
@@ -66,13 +67,13 @@ PG_MODULE_MAGIC;
 #define CONSUMER_ATTR_BATCH_SIZE 	7
 #define CONSUMER_ATTR_PARALLELISM 	8
 
-#define OFFSETS_RELATION "pipeline_kafka_offsets"
+#define OFFSETS_RELATION "offsets"
 #define OFFSETS_RELATION_NATTS	3
 #define OFFSETS_ATTR_CONSUMER 	1
 #define OFFSETS_ATTR_PARTITION	2
 #define OFFSETS_ATTR_OFFSET 	3
 
-#define BROKER_RELATION "pipeline_kafka_brokers"
+#define BROKER_RELATION "brokers"
 #define BROKER_RELATION_NATTS	1
 #define BROKER_ATTR_HOST 		1
 
@@ -200,7 +201,7 @@ kafka_consume_main_sigterm(SIGNAL_ARGS)
 static Relation
 open_pipeline_kafka_consumers(void)
 {
-	Relation consumers = heap_openrv(makeRangeVar(NULL, CONSUMER_RELATION, -1), AccessExclusiveLock);
+	Relation consumers = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, CONSUMER_RELATION, -1), ExclusiveLock);
 	return consumers;
 }
 
@@ -212,7 +213,7 @@ open_pipeline_kafka_consumers(void)
 static Relation
 open_pipeline_kafka_brokers(void)
 {
-	Relation brokers = heap_openrv(makeRangeVar(NULL, BROKER_RELATION, -1), AccessExclusiveLock);
+	Relation brokers = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, BROKER_RELATION, -1), ExclusiveLock);
 	return brokers;
 }
 
@@ -224,7 +225,7 @@ open_pipeline_kafka_brokers(void)
 static Relation
 open_pipeline_kafka_offsets(void)
 {
-	Relation offsets = heap_openrv(makeRangeVar(NULL, OFFSETS_RELATION, -1), RowExclusiveLock);
+	Relation offsets = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, OFFSETS_RELATION, -1), RowExclusiveLock);
 	return offsets;
 }
 

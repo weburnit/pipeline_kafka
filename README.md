@@ -38,9 +38,9 @@ CREATE EXTENSION
 `pipeline_kafka` needs to know about any Kafka brokers it can connect to. Brokers can be added with `kafka_add_broker`:
 
 ```
-=# SELECT kafka_add_broker('localhost:9092');
- kafka_add_broker
-------------------
+=# SELECT pipeline_kafka.add_broker('localhost:9092');
+ add_broker
+------------
  success
 (1 row)
 ```
@@ -50,9 +50,9 @@ CREATE EXTENSION
 Assuming the existence of a stream named `topic_stream` that a continuous view is reading from, you can now begin ingesting data from Kafka (**note**: only static streams can consume data from Kafka):
 
 ```
-=# SELECT kafka_consume_begin('kafka_topic', 'topic_stream');
- kafka_consume_begin
-------------------
+=# SELECT pipeline_kafka.consume_begin('kafka_topic', 'topic_stream');
+ consume_begin
+---------------
  success
 (1 row)
 ```
@@ -60,9 +60,9 @@ Assuming the existence of a stream named `topic_stream` that a continuous view i
 This will launch a background worker that will read from the Kafka topic `kafka_topic`, and use `COPY` to write the messages to `topic_stream`. You can specifiy the format that `COPY` should expect, as well as a delimiter, quote and escape character:
 
 ```
-=# SELECT kafka_consume_begin('kafka_topic', 'topic_stream', format := 'text', delimiter := E'\t');
- kafka_consume_begin
-------------------
+=# SELECT pipeline_kafka.consume_begin('kafka_topic', 'topic_stream', format := 'text', delimiter := E'\t');
+ consume_begin
+---------------
  success
 (1 row)
 ```
@@ -70,9 +70,9 @@ This will launch a background worker that will read from the Kafka topic `kafka_
 Additionally, a `parallelism` argument can be specified that will evenly assign a subset of the topic's partitions to each consumer process:
 
 ```
-=# SELECT kafka_consume_begin('kafka_topic', 'topic_stream', parallelism := 4);
- kafka_consume_begin
-------------------
+=# SELECT pipeline_kafka.consume_begin('kafka_topic', 'topic_stream', parallelism := 4);
+ consume_begin
+---------------
  success
 (1 row)
 ```
@@ -81,9 +81,9 @@ Additionally, a `parallelism` argument can be specified that will evenly assign 
 To stop the worker, run:
 
 ```
-=# SELECT kafka_consume_end('kafka_topic', 'topic_stream');
- kafka_consume_end
-------------------
+=# SELECT pipeline_kafka.consume_end('kafka_topic', 'topic_stream');
+ consume_end
+-------------
  success
 (1 row)
 ```
@@ -91,15 +91,15 @@ To stop the worker, run:
 All existing consumers can be started or stopped at once by not passing any arguments to the previous functions:
 
 ```
-=# SELECT kafka_consume_begin();
- kafka_consume_begin
-------------------
+=# SELECT pipeline_kafka.consume_begin();
+ consume_begin
+---------------
  success
 (1 row)
 
-=# SELECT kafka_consume_end();
- kafka_consume_end
-------------------
+=# SELECT pipeline_kafka.consume_end();
+ consume_end
+-------------
  success
 (1 row)
 ```
@@ -109,29 +109,28 @@ All existing consumers can be started or stopped at once by not passing any argu
 You can also produce messages into Kafka topics.
 
 ```
-=# SELECT kafka_produce_message('kafka_topic', 'hello world!');
- kafka_produce_message
-------------------
+=# SELECT pipeline_kafka.produce_message('kafka_topic', 'hello world!');
+ produce_message
+-----------------
  success
 (1 row
 ```
 
 You can also specify a parition key or an explicit partition to produce the message into.
 
-
 ```
-=# SELECT kafka_produce_message('kafka_topic', 'hello world!', partition := 2);
- kafka_produce_message
-------------------
+=# SELECT pipeline_kafka.produce_message('kafka_topic', 'hello world!', partition := 2);
+ produce_message
+-----------------
  success
 (1 row
 ```
 
 pipeline_kafka also comes with a trigger function that can be used to produced JSON serialized tuples into Kafka topics. The trigger function can be only be used by `AFTER INSERT|UPDATE` and `FOR EACH ROW` triggers.
 ```
-=# CREATE TRIGGER tg 
+=# CREATE TRIGGER tg
      AFTER UPDATE ON t FOR EACH ROW WHEN (x = 1)
-     EXECUTE PROCEDURE kafka_emit_tuple('kafka_topic');
+     EXECUTE PROCEDURE pipeline_kafka.emit_tuple('kafka_topic');
 CREATE TRIGGER
 ```
 
