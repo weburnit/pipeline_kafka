@@ -96,6 +96,8 @@ PG_MODULE_MAGIC;
 
 static volatile sig_atomic_t got_sigterm = false;
 
+static slock_t elog_mutex;
+
 void _PG_init(void);
 
 static rd_kafka_t *MyKafka = NULL;
@@ -235,7 +237,9 @@ open_pipeline_kafka_offsets(void)
 static void
 consumer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
+	SpinLockAcquire(&elog_mutex);
 	elog(LOG, "[kafka consumer]: %s", buf);
+	SpinLockRelease(&elog_mutex);
 }
 
 /*
@@ -673,6 +677,8 @@ kafka_consume_main(Datum arg)
 
 	/* give this proc access to the database */
 	BackgroundWorkerInitializeConnection(NameStr(proc->dbname), NULL);
+
+	SpinLockInit(&elog_mutex);
 
 	/* load saved consumer state */
 	StartTransactionCommand();
@@ -1275,6 +1281,9 @@ kafka_add_broker(PG_FUNCTION_ARGS)
 	heap_endscan(scan);
 	heap_close(brokers, NoLock);
 
+	if (MyKafka)
+		rd_kafka_brokers_add(MyKafka, TextDatumGetCString(host));
+
 	RETURN_SUCCESS();
 }
 
@@ -1321,7 +1330,9 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 static void
 producer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
+	SpinLockAcquire(&elog_mutex);
 	elog(LOG, "[kafka producer]: %s", buf);
+	SpinLockRelease(&elog_mutex);
 }
 
 PG_FUNCTION_INFO_V1(kafka_produce_msg);
@@ -1360,6 +1371,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 			elog(ERROR, "no valid brokers were found");
 		}
 
+		SpinLockInit(&elog_mutex);
 		MyKafka = kafka;
 	}
 
