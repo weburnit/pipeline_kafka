@@ -5,6 +5,7 @@
 
 -- Consumers added with pipeline_kafka.consume_begin
 CREATE TABLE pipeline_kafka.consumers (
+  id          serial  PRIMARY KEY,
   relation    text    NOT NULL,
   topic       text    NOT NULL,
   format      text    NOT NULL,
@@ -12,19 +13,23 @@ CREATE TABLE pipeline_kafka.consumers (
   quote       text,
   escape      text,
   batchsize   integer NOT NULL,
-  parallelism integer NOT NULL
-) WITH OIDS;
+  parallelism integer NOT NULL,
+  UNIQUE (relation, topic)
+);
 
 CREATE TABLE pipeline_kafka.offsets (
-  consumer_id oid     NOT NULL,
+  consumer_id integer NOT NULL REFERENCES pipeline_kafka.consumers (id),
   partition   integer NOT NULL,
-  "offset"    bigint  NOT NULL
+  "offset"    bigint  NOT NULL,
+  PRIMARY KEY (consumer_id, partition)
 );
+
+CREATE INDEX offsets_customer_idx ON pipeline_kafka.offsets (consumer_id);
 
 -- Brokers added with pipeline_kafka.add_broker
 CREATE TABLE pipeline_kafka.brokers (
-	host text PRIMARY KEY
-) WITH OIDS;
+  host text PRIMARY KEY
+);
 
 CREATE FUNCTION pipeline_kafka.consume_begin (
   topic        text,

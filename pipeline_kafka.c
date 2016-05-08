@@ -21,9 +21,11 @@
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pipeline_stream_fn.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "commands/copy.h"
 #include "commands/dbcommands.h"
+#include "commands/sequence.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "lib/stringinfo.h"
@@ -58,14 +60,15 @@ PG_MODULE_MAGIC;
 
 #define CONSUMER_RELATION "consumers"
 #define CONSUMER_RELATION_NATTS		9
-#define CONSUMER_ATTR_RELATION 		1
-#define CONSUMER_ATTR_TOPIC			2
-#define CONSUMER_ATTR_FORMAT 		3
-#define CONSUMER_ATTR_DELIMITER 	4
-#define CONSUMER_ATTR_QUOTE			5
-#define CONSUMER_ATTR_ESCAPE		6
-#define CONSUMER_ATTR_BATCH_SIZE 	7
-#define CONSUMER_ATTR_PARALLELISM 	8
+#define CONSUMER_ATTR_ID	 		1
+#define CONSUMER_ATTR_RELATION 		2
+#define CONSUMER_ATTR_TOPIC			3
+#define CONSUMER_ATTR_FORMAT 		4
+#define CONSUMER_ATTR_DELIMITER 	5
+#define CONSUMER_ATTR_QUOTE			6
+#define CONSUMER_ATTR_ESCAPE		7
+#define CONSUMER_ATTR_BATCH_SIZE 	8
+#define CONSUMER_ATTR_PARALLELISM 	9
 
 #define OFFSETS_RELATION "offsets"
 #define OFFSETS_RELATION_NATTS	3
@@ -95,23 +98,21 @@ PG_MODULE_MAGIC;
 #define RD_KAFKA_OFFSET_NULL INT64_MIN
 
 static volatile sig_atomic_t got_sigterm = false;
-
+static rd_kafka_t *MyKafka = NULL;
 static slock_t elog_mutex;
 
 void _PG_init(void);
-
-static rd_kafka_t *MyKafka = NULL;
 
 /*
  * Shared-memory state for each consumer process
  */
 typedef struct KafkaConsumerProc
 {
-	Oid id;
-	Oid consumer_id;
+	int32 id;
+	int32 consumer_id;
 	int64 start_offset;
 	int partition_group;
-	NameData dbname;
+	Oid db;
 	BackgroundWorkerHandle worker;
 } KafkaConsumerProc;
 
@@ -120,7 +121,7 @@ typedef struct KafkaConsumerProc
  */
 typedef struct KafkaConsumerGroup
 {
-	Oid consumer_id;
+	int32 consumer_id;
 	int parallelism;
 } KafkaConsumerGroup;
 
@@ -129,7 +130,7 @@ typedef struct KafkaConsumerGroup
  */
 typedef struct KafkaConsumer
 {
-	Oid id;
+	int32 id;
 	List *brokers;
 	char *topic;
 	RangeVar *rel;
@@ -161,21 +162,19 @@ _PG_init(void)
 
 	MemSet(&ctl, 0, sizeof(HASHCTL));
 
-	ctl.keysize = sizeof(Oid);
+	ctl.keysize = sizeof(int32);
 	ctl.entrysize = sizeof(KafkaConsumerProc);
-	ctl.hash = oid_hash;
 
 	consumer_procs = ShmemInitHash("KafkaConsumerProcs", NUM_CONSUMERS_INIT,
-			NUM_CONSUMERS_MAX, &ctl, HASH_ELEM | HASH_FUNCTION);
+			NUM_CONSUMERS_MAX, &ctl, HASH_ELEM | HASH_BLOBS);
 
 	MemSet(&ctl, 0, sizeof(HASHCTL));
 
-	ctl.keysize = sizeof(Oid);
+	ctl.keysize = sizeof(int32);
 	ctl.entrysize = sizeof(KafkaConsumerGroup);
-	ctl.hash = oid_hash;
 
 	consumer_groups = ShmemInitHash("KafkaConsumerGroups", 2 * NUM_CONSUMERS_INIT,
-			2 * NUM_CONSUMERS_MAX, &ctl, HASH_ELEM | HASH_FUNCTION);
+			2 * NUM_CONSUMERS_MAX, &ctl, HASH_ELEM | HASH_BLOBS);
 }
 
 /*
@@ -195,40 +194,65 @@ kafka_consume_main_sigterm(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
-/*
- * open_pipeline_kafka_consumers
- *
- * Open and return pipeline_kafka_consumers relation
- */
-static Relation
-open_pipeline_kafka_consumers(void)
+static RangeVar *
+get_rangevar(char *relname)
 {
-	Relation consumers = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, CONSUMER_RELATION, -1), ExclusiveLock);
-	return consumers;
+	return makeRangeVar(PIPELINE_KAFKA_SCHEMA, relname, -1);
 }
 
-/*
- * open_pipeline_kafka_brokers
- *
- * Open and return pipeline_kafka_brokers relation
- */
-static Relation
-open_pipeline_kafka_brokers(void)
+static ResultRelInfo *
+relinfo_open(RangeVar *rv, LOCKMODE mode)
 {
-	Relation brokers = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, BROKER_RELATION, -1), ExclusiveLock);
-	return brokers;
+	Relation rel = relation_openrv(rv, mode);
+	ResultRelInfo *rinfo = makeNode(ResultRelInfo);
+
+	rinfo->ri_RangeTableIndex = 1; /* dummy */
+	rinfo->ri_RelationDesc = rel;
+	rinfo->ri_TrigDesc = NULL;
+
+	ExecOpenIndices(rinfo, false);
+
+	return rinfo;
 }
 
-/*
- * open_pipeline_kafka_offsets
- *
- * Open and return pipeline_kafka_offsets relation
- */
-static Relation
-open_pipeline_kafka_offsets(void)
+static void
+relinfo_close(ResultRelInfo *rinfo, LOCKMODE mode)
 {
-	Relation offsets = heap_openrv(makeRangeVar(PIPELINE_KAFKA_SCHEMA, OFFSETS_RELATION, -1), RowExclusiveLock);
-	return offsets;
+	ExecCloseIndices(rinfo);
+	relation_close(rinfo->ri_RelationDesc, mode);
+	pfree(rinfo);
+}
+
+static void
+update_indices(ResultRelInfo *rinfo, HeapTuple tup)
+{
+	EState *estate = CreateExecutorState();
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(rinfo->ri_RelationDesc));
+	ExecStoreTuple(tup, slot, InvalidBuffer, false);
+	estate->es_result_relation_info = rinfo;
+	ExecInsertIndexTuples(slot, &tup->t_self, estate, false, NULL, NIL);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+}
+
+static void
+relinfo_insert(ResultRelInfo *rinfo, HeapTuple tup)
+{
+	simple_heap_insert(rinfo->ri_RelationDesc, tup);
+	update_indices(rinfo, tup);
+}
+
+static void
+relinfo_update(ResultRelInfo *rinfo, ItemPointer tid, HeapTuple tup)
+{
+	simple_heap_update(rinfo->ri_RelationDesc, tid, tup);
+	update_indices(rinfo, tup);
+}
+
+static void
+relinfo_delete(ResultRelInfo *rinfo, ItemPointer tid)
+{
+	simple_heap_delete(rinfo->ri_RelationDesc, tid);
 }
 
 /*
@@ -252,11 +276,11 @@ get_all_brokers(void)
 {
 	HeapTuple tup = NULL;
 	HeapScanDesc scan;
-	Relation brokers = open_pipeline_kafka_brokers();
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(brokers));
+	ResultRelInfo *brokers = relinfo_open(get_rangevar(BROKER_RELATION), ExclusiveLock);
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(brokers->ri_RelationDesc));
 	List *result = NIL;
 
-	scan = heap_beginscan(brokers, GetTransactionSnapshot(), 0, NULL);
+	scan = heap_beginscan(brokers->ri_RelationDesc, GetTransactionSnapshot(), 0, NULL);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		char *host;
@@ -272,7 +296,7 @@ get_all_brokers(void)
 
 	ExecDropSingleTupleTableSlot(slot);
 	heap_endscan(scan);
-	heap_close(brokers, NoLock);
+	relinfo_close(brokers, NoLock);
 
 	return result;
 }
@@ -288,13 +312,15 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	MemoryContext old;
 	ScanKeyData skey[1];
 	HeapTuple tup = NULL;
-	HeapScanDesc scan;
-	Relation offsets = open_pipeline_kafka_offsets();
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets));
+	IndexScanDesc scan;
+	ResultRelInfo *offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
 	int i;
 
-	ScanKeyInit(&skey[0], OFFSETS_ATTR_CONSUMER, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
-	scan = heap_beginscan(offsets, GetTransactionSnapshot(), 1, skey);
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
+	scan = index_beginscan(offsets->ri_RelationDesc, offsets->ri_IndexRelationDescs[1],
+			GetTransactionSnapshot(), 1, 0);
+	index_rescan(scan, skey, 1, NULL, 0);
 
 	old = MemoryContextSwitchTo(CacheMemoryContext);
 	consumer->offsets = palloc0(meta->partition_cnt * sizeof(int64_t));
@@ -306,7 +332,7 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 
 	consumer->num_partitions = meta->partition_cnt;
 
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	while ((tup = index_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		Datum d;
 		bool isnull;
@@ -349,8 +375,8 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
-	heap_endscan(scan);
-	heap_close(offsets, RowExclusiveLock);
+	index_endscan(scan);
+	relinfo_close(offsets, NoLock);
 }
 
 /*
@@ -359,13 +385,13 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
  * Read consumer state from pipeline_kafka_consumers into the given struct
  */
 static void
-load_consumer_state(Oid worker_id, KafkaConsumer *consumer)
+load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 {
 	ScanKeyData skey[1];
 	HeapTuple tup = NULL;
-	HeapScanDesc scan;
-	Relation consumers = open_pipeline_kafka_consumers();
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(consumers));
+	IndexScanDesc scan;
+	ResultRelInfo *consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(consumers->ri_RelationDesc));
 	Datum d;
 	bool isnull;
 	text *qualified;
@@ -373,27 +399,33 @@ load_consumer_state(Oid worker_id, KafkaConsumer *consumer)
 
 	MemSet(consumer, 0, sizeof(KafkaConsumer));
 
-	ScanKeyInit(&skey[0], -2, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(worker_id));
-	scan = heap_beginscan(consumers, GetTransactionSnapshot(), 1, skey);
-	tup = heap_getnext(scan, ForwardScanDirection);
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(consumer_id));
+	scan = index_beginscan(consumers->ri_RelationDesc, consumers->ri_IndexRelationDescs[0],
+			GetTransactionSnapshot(), 1, 0);
+	index_rescan(scan, skey, 1, NULL, 0);
+	tup = index_getnext(scan, ForwardScanDirection);
 
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "kafka consumer %d not found", worker_id);
+		elog(ERROR, "kafka consumer %d not found", consumer_id);
 
 	ExecStoreTuple(tup, slot, InvalidBuffer, false);
-	consumer->id = HeapTupleGetOid(tup);
-
-	d = slot_getattr(slot, CONSUMER_ATTR_RELATION, &isnull);
 
 	/* we don't want anything that's palloc'd to get freed when we commit */
 	old = MemoryContextSwitchTo(CacheMemoryContext);
 
+	d = slot_getattr(slot, CONSUMER_ATTR_ID, &isnull);
+	Assert(!isnull);
+	consumer->id = DatumGetInt32(d);
+
 	/* target relation */
+	d = slot_getattr(slot, CONSUMER_ATTR_RELATION, &isnull);
+	Assert(!isnull);
 	qualified = (text *) DatumGetPointer(d);
 	consumer->rel = makeRangeVarFromNameList(textToQualifiedNameList(qualified));
 
 	/* topic */
 	d = slot_getattr(slot, CONSUMER_ATTR_TOPIC, &isnull);
+	Assert(!isnull);
 	consumer->topic = TextDatumGetCString(d);
 
 	/* format */
@@ -433,8 +465,8 @@ load_consumer_state(Oid worker_id, KafkaConsumer *consumer)
 	consumer->batch_size = DatumGetInt32(d);
 
 	ExecDropSingleTupleTableSlot(slot);
-	heap_endscan(scan);
-	heap_close(consumers, NoLock);
+	index_endscan(scan);
+	relinfo_close(consumers, NoLock);
 }
 
 /*
@@ -462,31 +494,31 @@ copy_next(void *args, void *buf, int minread, int maxread)
 }
 
 /*
- * save_consumer_state
- *
- * Saves the given consumer's state to pipeline_kafka_consumers
+ * save_consumer_offsets
  */
 static void
-save_consumer_state(KafkaConsumer *consumer, int partition_group)
+save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 {
 	ScanKeyData skey[1];
 	HeapTuple tup = NULL;
-	HeapScanDesc scan;
-	Relation offsets = open_pipeline_kafka_offsets();
+	IndexScanDesc scan;
+	ResultRelInfo *offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
 	Datum values[OFFSETS_RELATION_NATTS];
 	bool nulls[OFFSETS_RELATION_NATTS];
 	bool replace[OFFSETS_RELATION_NATTS];
 	bool updated[consumer->num_partitions];
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets));
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
 	int partition;
 
 	MemSet(updated, false, sizeof(updated));
 
-	ScanKeyInit(&skey[0], OFFSETS_ATTR_CONSUMER, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
-	scan = heap_beginscan(offsets, GetTransactionSnapshot(), 1, skey);
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
+	scan = index_beginscan(offsets->ri_RelationDesc, offsets->ri_IndexRelationDescs[1],
+			GetTransactionSnapshot(), 1, 0);
+	index_rescan(scan, skey, 1, NULL, 0);
 
 	/* update any existing offset rows */
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	while ((tup = index_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		Datum d;
 		bool isnull;
@@ -517,11 +549,11 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 		values[OFFSETS_ATTR_OFFSET - 1] = Int64GetDatum(consumer->offsets[partition]);
 		replace[OFFSETS_ATTR_OFFSET - 1] = true;
 
-		modified = heap_modify_tuple(tup, RelationGetDescr(offsets), values, nulls, replace);
-		simple_heap_update(offsets, &modified->t_self, modified);
+		modified = heap_modify_tuple(tup, RelationGetDescr(offsets->ri_RelationDesc), values, nulls, replace);
+		relinfo_update(offsets, &modified->t_self, modified);
 	}
 
-	heap_endscan(scan);
+	index_endscan(scan);
 
 	/* now insert any offset rows that didn't already exist */
 	for (partition = 0; partition < consumer->num_partitions; partition++)
@@ -538,12 +570,12 @@ save_consumer_state(KafkaConsumer *consumer, int partition_group)
 
 		MemSet(nulls, false, sizeof(nulls));
 
-		tup = heap_form_tuple(RelationGetDescr(offsets), values, nulls);
-		simple_heap_insert(offsets, tup);
+		tup = heap_form_tuple(RelationGetDescr(offsets->ri_RelationDesc), values, nulls);
+		relinfo_insert(offsets, tup);
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
-	heap_close(offsets, NoLock);
+	relinfo_close(offsets, NoLock);
 }
 
 /*
@@ -653,7 +685,7 @@ kafka_consume_main(Datum arg)
 	struct rd_kafka_metadata_topic topic_meta;
 	rd_kafka_resp_err_t err;
 	bool found;
-	Oid id = (Oid) arg;
+	int32 id = DatumGetInt32(arg);
 	ListCell *lc;
 	KafkaConsumerProc *proc = hash_search(consumer_procs, &id, HASH_FIND, &found);
 	KafkaConsumer consumer;
@@ -664,7 +696,7 @@ kafka_consume_main(Datum arg)
 	MemoryContext work_ctx;
 
 	if (!found)
-		elog(ERROR, "kafka consumer %d not found", id);
+		elog(ERROR, "kafka consumer process %d not found", id);
 
 	pqsignal(SIGTERM, kafka_consume_main_sigterm);
 #define BACKTRACE_SEGFAULTS
@@ -676,7 +708,7 @@ kafka_consume_main(Datum arg)
 	BackgroundWorkerUnblockSignals();
 
 	/* give this proc access to the database */
-	BackgroundWorkerInitializeConnection(NameStr(proc->dbname), NULL);
+	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
 
 	SpinLockInit(&elog_mutex);
 
@@ -690,7 +722,7 @@ kafka_consume_main(Datum arg)
 	rd_kafka_set_logger(kafka, consumer_logger);
 
 	/*
-	 * Add all brokers currently in pipeline_kafka_brokers
+	 * Add all brokers currently in pipeline_kafka.brokers
 	 */
 	if (consumer.brokers == NIL)
 		elog(ERROR, "no valid brokers were found");
@@ -839,13 +871,12 @@ kafka_consume_main(Datum arg)
 		if (!IsTransactionState())
 			StartTransactionCommand();
 
-		save_consumer_state(&consumer, proc->partition_group);
+		save_consumer_offsets(&consumer, proc->partition_group);
 
 		CommitTransactionCommand();
 	}
 
 done:
-
 	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 
 	rd_kafka_topic_destroy(topic);
@@ -856,26 +887,29 @@ done:
 /*
  * create_consumer
  *
- * Create a row in pipeline_kafka_consumers representing a topic-relation consumer
+ * Create a row in pipeline_kafka.consumers representing a topic-relation consumer
  */
-static Oid
-create_or_update_consumer(Relation consumers, text *relation, text *topic,
+static int32
+create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 		text *format, text *delimiter, text *quote, text *escape, int batchsize, int parallelism)
 {
 	HeapTuple tup;
 	Datum values[CONSUMER_RELATION_NATTS];
 	bool nulls[CONSUMER_RELATION_NATTS];
-	Oid oid;
+	int32 consumer_id = 0;
 	ScanKeyData skey[2];
-	HeapScanDesc scan;
+	IndexScanDesc scan;
+	bool isnull;
 
 	MemSet(nulls, false, sizeof(nulls));
 
 	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
 	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
 
-	scan = heap_beginscan(consumers, GetTransactionSnapshot(), 2, skey);
-	tup = heap_getnext(scan, ForwardScanDirection);
+	scan = index_beginscan(consumers->ri_RelationDesc, consumers->ri_IndexRelationDescs[1],
+			GetTransactionSnapshot(), 2, 0);
+	index_rescan(scan, skey, 2, NULL, 0);
+	tup = index_getnext(scan, ForwardScanDirection);
 
 	values[CONSUMER_ATTR_BATCH_SIZE - 1] = Int32GetDatum(batchsize);
 	values[CONSUMER_ATTR_PARALLELISM - 1] = Int32GetDatum(parallelism);
@@ -901,58 +935,76 @@ create_or_update_consumer(Relation consumers, text *relation, text *topic,
 		/* consumer already exists, so just update it with the given parameters */
 		bool replace[CONSUMER_RELATION_NATTS];
 
-		MemSet(replace, true, sizeof(nulls));
+		MemSet(replace, true, sizeof(replace));
+		replace[CONSUMER_ATTR_ID - 1] = false;
 		replace[CONSUMER_ATTR_RELATION - 1] = false;
 		replace[CONSUMER_ATTR_TOPIC - 1] = false;
 
-		tup = heap_modify_tuple(tup, RelationGetDescr(consumers), values, nulls, replace);
-		simple_heap_update(consumers, &tup->t_self, tup);
+		tup = heap_modify_tuple(tup, RelationGetDescr(consumers->ri_RelationDesc), values, nulls, replace);
+		relinfo_update(consumers, &tup->t_self, tup);
 
-		oid = HeapTupleGetOid(tup);
+		consumer_id = DatumGetInt32(heap_getattr(tup, CONSUMER_ATTR_ID,
+				RelationGetDescr(consumers->ri_RelationDesc), &isnull));
+		Assert(!isnull);
 	}
 	else
 	{
+		Relation seqrel;
+
 		/* consumer doesn't exist yet, create it with the given parameters */
 		values[CONSUMER_ATTR_RELATION - 1] = PointerGetDatum(relation);
 		values[CONSUMER_ATTR_TOPIC - 1] = PointerGetDatum(topic);
 
-		tup = heap_form_tuple(RelationGetDescr(consumers), values, nulls);
-		oid = simple_heap_insert(consumers, tup);
+		seqrel = heap_openrv(get_rangevar("consumers_id_seq"), AccessShareLock);
+		consumer_id = nextval_internal(RelationGetRelid(seqrel));
+		heap_close(seqrel, NoLock);
+		values[CONSUMER_ATTR_ID -1] = Int32GetDatum(consumer_id);
+
+		tup = heap_form_tuple(RelationGetDescr(consumers->ri_RelationDesc), values, nulls);
+		relinfo_insert(consumers, tup);
 	}
 
-	heap_endscan(scan);
+	index_endscan(scan);
 
 	CommandCounterIncrement();
 
-	return oid;
+	Assert(consumer_id > 0);
+	return consumer_id;
 }
 
 /*
  * get_consumer_id
  *
- * Get the pipeline_kafka_consumers oid for the given relation-topic pair
+ * Get the pipeline_kafka.consumers id for the given relation-topic pair
  *
  */
-static Oid
-get_consumer_id(Relation consumers, text *relation, text *topic)
+static int32
+get_consumer_id(ResultRelInfo *consumers, text *relation, text *topic)
 {
 	ScanKeyData skey[2];
 	HeapTuple tup = NULL;
-	HeapScanDesc scan;
-	Oid oid = InvalidOid;
+	IndexScanDesc scan;
+	int32 id = 0;
 
 	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
 	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
 
-	scan = heap_beginscan(consumers, GetTransactionSnapshot(), 2, skey);
-	tup = heap_getnext(scan, ForwardScanDirection);
+	scan = index_beginscan(consumers->ri_RelationDesc, consumers->ri_IndexRelationDescs[1],
+			GetTransactionSnapshot(), 2, 0);
+	index_rescan(scan, skey, 2, NULL, 0);
+	tup = index_getnext(scan, ForwardScanDirection);
 
 	if (HeapTupleIsValid(tup))
-		oid = HeapTupleGetOid(tup);
+	{
+		bool isnull;
+		id = DatumGetInt32(heap_getattr(tup, CONSUMER_ATTR_ID,
+				RelationGetDescr(consumers->ri_RelationDesc), &isnull));
+		Assert(!isnull);
+	}
 
-	heap_endscan(scan);
+	index_endscan(scan);
 
-	return oid;
+	return id;
 }
 
 /*
@@ -962,7 +1014,7 @@ get_consumer_id(Relation consumers, text *relation, text *topic)
  * into the given relation
  */
 static bool
-launch_consumer_group(Relation consumers, KafkaConsumer *consumer, int64 offset)
+launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 {
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle;
@@ -987,7 +1039,8 @@ launch_consumer_group(Relation consumers, KafkaConsumer *consumer, int64 offset)
 		/* if there are already procs running, it's a noop */
 		if (running)
 		{
-			elog(WARNING, "%s is already being consumed into relation %s", consumer->topic, consumer->rel->relname);
+			elog(WARNING, "%s is already being consumed into relation %s",
+					consumer->topic, consumer->rel->relname);
 			return true;
 		}
 
@@ -998,15 +1051,24 @@ launch_consumer_group(Relation consumers, KafkaConsumer *consumer, int64 offset)
 
 	for (i = 0; i < group->parallelism; i++)
 	{
-		/* we just need any unique OID here */
-		Oid id = GetNewOid(consumers);
+		/* we just need any unique id here */
+		int32 id = rand();
 		KafkaConsumerProc *proc;
 
 		proc = (KafkaConsumerProc *) hash_search(consumer_procs, &id, HASH_ENTER, &found);
 		if (found)
+		{
+			i--;
 			continue;
+		}
 
-		worker.bgw_main_arg = DatumGetObjectId(id);
+		proc->id = id;
+		proc->consumer_id = consumer->id;
+		proc->partition_group = i;
+		proc->start_offset = offset;
+		proc->db = MyDatabaseId;
+
+		worker.bgw_main_arg = Int32GetDatum(id);
 		worker.bgw_flags = BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_SHMEM_ACCESS;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 		worker.bgw_restart_time = BGW_NEVER_RESTART;
@@ -1016,12 +1078,8 @@ launch_consumer_group(Relation consumers, KafkaConsumer *consumer, int64 offset)
 		/* this module is loaded dynamically, so we can't use bgw_main */
 		sprintf(worker.bgw_library_name, PIPELINE_KAFKA_LIB);
 		sprintf(worker.bgw_function_name, KAFKA_CONSUME_MAIN);
-		snprintf(worker.bgw_name, BGW_MAXLEN, "[kafka consumer] %s <- %s", consumer->rel->relname, consumer->topic);
-
-		proc->consumer_id = consumer->id;
-		proc->partition_group = i;
-		proc->start_offset = offset;
-		namestrcpy(&proc->dbname, get_database_name(MyDatabaseId));
+		snprintf(worker.bgw_name, BGW_MAXLEN, "[kafka consumer] %s <- %s",
+				consumer->rel->relname, consumer->topic);
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 			return false;
@@ -1045,9 +1103,9 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	text *qualified_name;
 	RangeVar *relname;
 	Relation rel;
-	Relation consumers;
+	ResultRelInfo *consumers;
 	Oid id;
-	bool result;
+	bool success;
 	text *format;
 	text *delimiter;
 	text *quote;
@@ -1100,11 +1158,11 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 
 	/* there's no point in progressing if there aren't any brokers */
 	if (!get_all_brokers())
-		elog(ERROR, "add at least one broker with kafka_add_broker");
+		elog(ERROR, "add at least one broker with pipeline_kafka.add_broker");
 
 	/* verify that the target relation actually exists */
 	relname = makeRangeVarFromNameList(textToQualifiedNameList(qualified_name));
-	rel = heap_openrv(relname, NoLock);
+	rel = heap_openrv(relname, AccessShareLock);
 
 	if (IsInferredStream(RelationGetRelid(rel)))
 		ereport(ERROR,
@@ -1113,14 +1171,14 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 
 	heap_close(rel, NoLock);
 
-	consumers = open_pipeline_kafka_consumers();
+	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 	id = create_or_update_consumer(consumers, qualified_name, topic, format,
 			delimiter, quote, escape, batchsize, parallelism);
 	load_consumer_state(id, &consumer);
-	result = launch_consumer_group(consumers, &consumer, offset);
-	heap_close(consumers, NoLock);
+	success = launch_consumer_group(&consumer, offset);
+	relinfo_close(consumers, NoLock);
 
-	if (result)
+	if (success)
 		RETURN_SUCCESS();
 	else
 		RETURN_FAILURE();
@@ -1136,9 +1194,9 @@ Datum
 kafka_consume_end_tr(PG_FUNCTION_ARGS)
 {
 	text *topic;
-	text *qualified;
-	Relation consumers;
-	Oid id;
+	text *relation;
+	ResultRelInfo *consumers;
+	int32 id;
 	bool found;
 	HASH_SEQ_STATUS iter;
 	KafkaConsumerProc *proc;
@@ -1149,16 +1207,16 @@ kafka_consume_end_tr(PG_FUNCTION_ARGS)
 		elog(ERROR, "relation cannot be null");
 
 	topic = PG_GETARG_TEXT_P(0);
-	qualified = PG_GETARG_TEXT_P(1);
-	consumers = open_pipeline_kafka_consumers();
+	relation = PG_GETARG_TEXT_P(1);
+	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 
-	id = get_consumer_id(consumers, qualified, topic);
-	if (!OidIsValid(id))
-		elog(ERROR, "there are no consumers for that topic and relation");
+	id = get_consumer_id(consumers, relation, topic);
+	if (!id)
+		elog(ERROR, "there are no consumers for this topic and relation");
 
 	hash_search(consumer_groups, &id, HASH_REMOVE, &found);
 	if (!found)
-		elog(ERROR, "no consumer processes are running for that topic and relation");
+		elog(ERROR, "no consumer processes are running for this topic and relation");
 
 	hash_seq_init(&iter, consumer_procs);
 	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
@@ -1170,7 +1228,7 @@ kafka_consume_end_tr(PG_FUNCTION_ARGS)
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
 
-	heap_close(consumers, NoLock);
+	relinfo_close(consumers, NoLock);
 	RETURN_SUCCESS();
 }
 
@@ -1185,21 +1243,25 @@ kafka_consume_begin_all(PG_FUNCTION_ARGS)
 {
 	HeapTuple tup = NULL;
 	HeapScanDesc scan;
-	Relation consumers = open_pipeline_kafka_consumers();
+	ResultRelInfo *consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 
-	scan = heap_beginscan(consumers, GetTransactionSnapshot(), 0, NULL);
+	scan = heap_beginscan(consumers->ri_RelationDesc, GetTransactionSnapshot(), 0, NULL);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-		Oid id = HeapTupleGetOid(tup);
+		bool isnull;
+		int32 id = DatumGetInt32(heap_getattr(tup, CONSUMER_ATTR_ID,
+				RelationGetDescr(consumers->ri_RelationDesc), &isnull));
 		KafkaConsumer consumer;
 
+		Assert(!isnull);
+
 		load_consumer_state(id, &consumer);
-		if (!launch_consumer_group(consumers, &consumer, RD_KAFKA_OFFSET_END))
+		if (!launch_consumer_group(&consumer, RD_KAFKA_OFFSET_END))
 			RETURN_FAILURE();
 	}
 
 	heap_endscan(scan);
-	heap_close(consumers, NoLock);
+	relinfo_close(consumers, NoLock);
 
 	RETURN_SUCCESS();
 }
@@ -1223,12 +1285,12 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 	{
 		TerminateBackgroundWorker(&proc->worker);
 		hash_search(consumer_groups, &proc->consumer_id, HASH_REMOVE, NULL);
-		ids = lappend_oid(ids, proc->id);
+		ids = lappend_int(ids, proc->id);
 	}
 
 	foreach(lc, ids)
 	{
-		Oid id = lfirst_oid(lc);
+		int32 id = lfirst_int(lc);
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
 
@@ -1247,7 +1309,8 @@ kafka_add_broker(PG_FUNCTION_ARGS)
 	HeapTuple tup;
 	Datum values[1];
 	bool nulls[1];
-	Relation brokers;
+	ResultRelInfo *brokers;
+	Relation rel;
 	text *host;
 	ScanKeyData skey[1];
 	HeapScanDesc scan;
@@ -1256,18 +1319,19 @@ kafka_add_broker(PG_FUNCTION_ARGS)
 		elog(ERROR, "broker cannot be null");
 
 	host = PG_GETARG_TEXT_P(0);
-	brokers = open_pipeline_kafka_brokers();
+	brokers = relinfo_open(get_rangevar(BROKER_RELATION), RowExclusiveLock);
+	rel = brokers->ri_RelationDesc;
 
 	/* don't allow duplicate brokers */
-	ScanKeyInit(&skey[0], BROKER_ATTR_HOST, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(host));
-	scan = heap_beginscan(brokers, GetTransactionSnapshot(), 1, skey);
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(host));
+	scan = heap_beginscan(rel, GetTransactionSnapshot(), 1, skey);
 	tup = heap_getnext(scan, ForwardScanDirection);
 
 	if (HeapTupleIsValid(tup))
 	{
 		heap_endscan(scan);
-		heap_close(brokers, NoLock);
-		elog(ERROR, "broker %s already exists", TextDatumGetCString(host));
+		relinfo_close(brokers, NoLock);
+		elog(ERROR, "broker \"%s\" already exists", TextDatumGetCString(host));
 	}
 
 	/* broker host */
@@ -1275,11 +1339,11 @@ kafka_add_broker(PG_FUNCTION_ARGS)
 
 	MemSet(nulls, false, sizeof(nulls));
 
-	tup = heap_form_tuple(RelationGetDescr(brokers), values, nulls);
-	simple_heap_insert(brokers, tup);
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	relinfo_insert(brokers, tup);
 
 	heap_endscan(scan);
-	heap_close(brokers, NoLock);
+	relinfo_close(brokers, NoLock);
 
 	if (MyKafka)
 		rd_kafka_brokers_add(MyKafka, TextDatumGetCString(host));
@@ -1297,7 +1361,7 @@ Datum
 kafka_remove_broker(PG_FUNCTION_ARGS)
 {
 	HeapTuple tup;
-	Relation brokers;
+	ResultRelInfo *brokers;
 	text *host;
 	ScanKeyData skey[1];
 	HeapScanDesc scan;
@@ -1306,20 +1370,20 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 		elog(ERROR, "broker cannot be null");
 
 	host = PG_GETARG_TEXT_P(0);
-	brokers = open_pipeline_kafka_brokers();
+	brokers = relinfo_open(get_rangevar(BROKER_RELATION), RowExclusiveLock);
 
 	/* don't allow duplicate brokers */
-	ScanKeyInit(&skey[0], BROKER_ATTR_HOST, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(host));
-	scan = heap_beginscan(brokers, GetTransactionSnapshot(), 1, skey);
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(host));
+	scan = heap_beginscan(brokers->ri_RelationDesc, GetTransactionSnapshot(), 1, skey);
 	tup = heap_getnext(scan, ForwardScanDirection);
 
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "broker %s does not exist", TextDatumGetCString(host));
+		elog(ERROR, "broker \"%s\" does not exist", TextDatumGetCString(host));
 
-	simple_heap_delete(brokers, &tup->t_self);
+	relinfo_delete(brokers, &tup->t_self);
 
 	heap_endscan(scan);
-	heap_close(brokers, NoLock);
+	relinfo_close(brokers, NoLock);
 
 	RETURN_SUCCESS();
 }
