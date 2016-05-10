@@ -206,8 +206,8 @@ check_pipeline_kafka_preloaded(void)
 	{
 		Assert(!consumer_procs);
 		ereport(ERROR,
-				(errmsg("It seems like \"%s\" wasn't loaded as a shared library", PIPELINE_KAFKA_LIB),
-				errhint("Add \"%s\" to the shared_preload_libraries configuration parameter.", PIPELINE_KAFKA_LIB)));
+				(errmsg("%s wasn't loaded as a shared library", PIPELINE_KAFKA_LIB),
+				errhint("Add %s to the shared_preload_libraries configuration parameter.", PIPELINE_KAFKA_LIB)));
 	}
 }
 
