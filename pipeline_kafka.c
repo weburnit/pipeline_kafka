@@ -109,19 +109,25 @@ void _PG_init(void);
 typedef struct KafkaConsumerProc
 {
 	int32 id;
+	Oid db;
 	int32 consumer_id;
 	int64 start_offset;
 	int partition_group;
-	Oid db;
 	BackgroundWorkerHandle worker;
 } KafkaConsumerProc;
+
+typedef struct KafkaConsumerGroupKey
+{
+	Oid db;
+	int32 consumer_id;
+} KafkaConsumerGroupKey;
 
 /*
  * Shared-memory state for each consumer process group
  */
 typedef struct KafkaConsumerGroup
 {
-	int32 consumer_id;
+	KafkaConsumerGroupKey key;
 	int parallelism;
 } KafkaConsumerGroup;
 
@@ -170,7 +176,7 @@ _PG_init(void)
 
 	MemSet(&ctl, 0, sizeof(HASHCTL));
 
-	ctl.keysize = sizeof(int32);
+	ctl.keysize = sizeof(KafkaConsumerGroupKey);
 	ctl.entrysize = sizeof(KafkaConsumerGroup);
 
 	consumer_groups = ShmemInitHash("KafkaConsumerGroups", 2 * NUM_CONSUMERS_INIT,
@@ -1021,8 +1027,12 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 	KafkaConsumerGroup *group;
 	bool found;
 	int i;
+	KafkaConsumerGroupKey key;
 
-	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &consumer->id, HASH_ENTER, &found);
+	key.db = MyDatabaseId;
+	key.consumer_id = consumer->id;
+
+	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_ENTER, &found);
 	if (found)
 	{
 		KafkaConsumerProc *proc;
@@ -1032,7 +1042,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		hash_seq_init(&iter, consumer_procs);
 		while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
 		{
-			if (proc->consumer_id == consumer->id)
+			if (proc->consumer_id == consumer->id && proc->db == MyDatabaseId)
 				running = true;
 		}
 
@@ -1200,6 +1210,7 @@ kafka_consume_end_tr(PG_FUNCTION_ARGS)
 	bool found;
 	HASH_SEQ_STATUS iter;
 	KafkaConsumerProc *proc;
+	KafkaConsumerGroupKey key;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "topic cannot be null");
@@ -1214,14 +1225,17 @@ kafka_consume_end_tr(PG_FUNCTION_ARGS)
 	if (!id)
 		elog(ERROR, "there are no consumers for this topic and relation");
 
-	hash_search(consumer_groups, &id, HASH_REMOVE, &found);
+	key.consumer_id = id;
+	key.db = MyDatabaseId;
+
+	hash_search(consumer_groups, &key, HASH_REMOVE, &found);
 	if (!found)
 		elog(ERROR, "no consumer processes are running for this topic and relation");
 
 	hash_seq_init(&iter, consumer_procs);
 	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
 	{
-		if (proc->consumer_id != id)
+		if (proc->consumer_id != id && proc->db == MyDatabaseId)
 			continue;
 
 		TerminateBackgroundWorker(&proc->worker);
@@ -1279,12 +1293,21 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 	KafkaConsumerProc *proc;
 	List *ids = NIL;
 	ListCell *lc;
+	KafkaConsumerGroupKey key;
+
+	key.db = MyDatabaseId;
 
 	hash_seq_init(&iter, consumer_procs);
 	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
 	{
+		if (proc->db != MyDatabaseId)
+			continue;
+
 		TerminateBackgroundWorker(&proc->worker);
-		hash_search(consumer_groups, &proc->consumer_id, HASH_REMOVE, NULL);
+
+		key.consumer_id = proc->consumer_id;
+		hash_search(consumer_groups, &key, HASH_REMOVE, NULL);
+
 		ids = lappend_int(ids, proc->id);
 	}
 
