@@ -100,6 +100,7 @@ PG_MODULE_MAGIC;
 static volatile sig_atomic_t got_sigterm = false;
 static rd_kafka_t *MyKafka = NULL;
 static slock_t elog_mutex;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 void _PG_init(void);
 
@@ -153,18 +154,20 @@ typedef struct KafkaConsumer
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
-static HTAB *consumer_groups;
+static HTAB *consumer_groups = NULL;
 
 /* Shared-memory hashtable storing all individual consumer process information */
-static HTAB *consumer_procs;
+static HTAB *consumer_procs = NULL;
 
-/*
- * Initialization performed at module-load time
- */
-void
-_PG_init(void)
+static void
+pipeline_kafka_shmem_startup(void)
 {
 	HASHCTL ctl;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
 	MemSet(&ctl, 0, sizeof(HASHCTL));
 
@@ -181,6 +184,49 @@ _PG_init(void)
 
 	consumer_groups = ShmemInitHash("KafkaConsumerGroups", 2 * NUM_CONSUMERS_INIT,
 			2 * NUM_CONSUMERS_MAX, &ctl, HASH_ELEM | HASH_BLOBS);
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+static Size
+pipeline_kafka_shmem_size(void)
+{
+	Size size;
+
+	size = hash_estimate_size(max_worker_processes, sizeof(KafkaConsumerGroup));
+	size = add_size(size, hash_estimate_size(max_worker_processes, sizeof(KafkaConsumerProc)));
+
+	return size;
+}
+
+static void
+check_pipeline_kafka_preloaded(void)
+{
+	if (!consumer_groups)
+	{
+		Assert(!consumer_procs);
+		ereport(ERROR,
+				(errmsg("It seems like \"%s\" wasn't loaded as a shared library", PIPELINE_KAFKA_LIB),
+				errhint("Add \"%s\" to the shared_preload_libraries configuration parameter.", PIPELINE_KAFKA_LIB)));
+	}
+}
+
+/*
+ * Initialization performed at module-load time
+ */
+void
+_PG_init(void)
+{
+	if (!process_shared_preload_libraries_in_progress)
+	{
+		elog(WARNING, "%s must be loaded via shared_preload_libraries", PIPELINE_KAFKA_LIB);
+		return;
+	}
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pipeline_kafka_shmem_startup;
+
+	RequestAddinShmemSpace(MAXALIGN(pipeline_kafka_shmem_size()));
 }
 
 /*
@@ -1125,6 +1171,8 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	int64 offset;
 	KafkaConsumer consumer;
 
+	check_pipeline_kafka_preloaded();
+
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "topic cannot be null");
 	if (PG_ARGISNULL(1))
@@ -1212,6 +1260,8 @@ kafka_consume_end_tr(PG_FUNCTION_ARGS)
 	KafkaConsumerProc *proc;
 	KafkaConsumerGroupKey key;
 
+	check_pipeline_kafka_preloaded();
+
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "topic cannot be null");
 	if (PG_ARGISNULL(1))
@@ -1257,7 +1307,11 @@ kafka_consume_begin_all(PG_FUNCTION_ARGS)
 {
 	HeapTuple tup = NULL;
 	HeapScanDesc scan;
-	ResultRelInfo *consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
+	ResultRelInfo *consumers;
+
+	check_pipeline_kafka_preloaded();
+
+	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 
 	scan = heap_beginscan(consumers->ri_RelationDesc, GetTransactionSnapshot(), 0, NULL);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
@@ -1296,6 +1350,8 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 	KafkaConsumerGroupKey key;
 
 	key.db = MyDatabaseId;
+
+	check_pipeline_kafka_preloaded();
 
 	hash_seq_init(&iter, consumer_procs);
 	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
@@ -1337,6 +1393,8 @@ kafka_add_broker(PG_FUNCTION_ARGS)
 	text *host;
 	ScanKeyData skey[1];
 	HeapScanDesc scan;
+
+	check_pipeline_kafka_preloaded();
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "broker cannot be null");
@@ -1389,6 +1447,8 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 	ScanKeyData skey[1];
 	HeapScanDesc scan;
 
+	check_pipeline_kafka_preloaded();
+
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "broker cannot be null");
 
@@ -1434,6 +1494,8 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	int32 partition;
 	char *key;
 	int keylen;
+
+	check_pipeline_kafka_preloaded();
 
 	if (MyKafka == NULL)
 	{
@@ -1508,6 +1570,8 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 	TupleDesc desc;
 	Datum json;
 	char *topic;
+
+	check_pipeline_kafka_preloaded();
 
 	if (trig->tgnargs < 1)
 		elog(ERROR, "kafka_emit_tuple: must be provided a topic name");

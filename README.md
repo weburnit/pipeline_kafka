@@ -26,7 +26,13 @@ make
 make install
 ```
 
-Then you'll be able load the extension into a database:
+`pipeline_kafka` requires some shared memory so it must be preloaded as a shared library. You can do so by adding the following line to your `pipelinedb.conf` file. If you're already loading some shared libraries, then simply add `pipeline_kafka` as a comma-separated list.
+
+```
+shared_preload_libraries = pipeline_kafka
+```
+
+Now you can load the extension into a database:
 
 ```
 =# CREATE EXTENSION pipeline_kafka;
