@@ -1,10 +1,8 @@
-# contrib/pipeline_kafka/Makefile
-
 MODULE_big = pipeline_kafka
 OBJS = pipeline_kafka.o
 
 EXTENSION = pipeline_kafka
-DATA = pipeline_kafka--0.9.1.sql
+DATA = pipeline_kafka--0.9.2.sql
 
 REGRESS = pipeline_kafka
 

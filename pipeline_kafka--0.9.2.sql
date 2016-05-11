@@ -1,5 +1,3 @@
-/* contrib/pipeline_kafka/pipeline_kafka--0.9.1.sql */
-
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pipeline_kafka" to load this file. \quit
 
