@@ -132,7 +132,8 @@ You can also specify a parition key or an explicit partition to produce the mess
 (1 row
 ```
 
-pipeline_kafka also comes with a trigger function that can be used to produced JSON serialized tuples into Kafka topics. The trigger function can be only be used by `AFTER INSERT|UPDATE` and `FOR EACH ROW` triggers.
+`pipeline_kafka` also comes with a trigger function that can be used to produced JSON serialized tuples into Kafka topics. The trigger function can be only be used by `AFTER [INSERT | UPDATE]` and `FOR EACH ROW` triggers.
+
 ```
 =# CREATE TRIGGER tg
      AFTER UPDATE ON t FOR EACH ROW WHEN (x = 1)
