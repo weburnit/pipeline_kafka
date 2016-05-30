@@ -1202,11 +1202,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	{
 		pfree(format);
 		format = (text *) CStringGetTextDatum(FORMAT_CSV);
-		if (delimiter != NULL)
-			elog(WARNING, "delimiter cannot be specified with format \"json\", ignoring");
 		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
-		if (quote != NULL)
-			elog(WARNING, "quote cannot be specified with format \"json\", ignoring");
 		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
 
 	}
