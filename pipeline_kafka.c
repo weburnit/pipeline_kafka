@@ -35,6 +35,7 @@
 #include "nodes/print.h"
 #include "pipeline_kafka.h"
 #include "pipeline/stream.h"
+#include "port/atomics.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -59,7 +60,7 @@ PG_MODULE_MAGIC;
 #define PIPELINE_KAFKA_SCHEMA "pipeline_kafka"
 
 #define CONSUMER_RELATION "consumers"
-#define CONSUMER_RELATION_NATTS		9
+#define CONSUMER_RELATION_NATTS		10
 #define CONSUMER_ATTR_ID	 		1
 #define CONSUMER_ATTR_RELATION 		2
 #define CONSUMER_ATTR_TOPIC			3
@@ -69,6 +70,7 @@ PG_MODULE_MAGIC;
 #define CONSUMER_ATTR_ESCAPE		7
 #define CONSUMER_ATTR_BATCH_SIZE 	8
 #define CONSUMER_ATTR_PARALLELISM 	9
+#define CONSUMER_ATTR_TIMEOUT	 	10
 
 #define OFFSETS_RELATION "offsets"
 #define OFFSETS_RELATION_NATTS	3
@@ -86,8 +88,7 @@ PG_MODULE_MAGIC;
 #define DEFAULT_PARALLELISM 1
 #define MAX_CONSUMER_PROCS 32
 
-#define CONSUMER_TIMEOUT 1000 /* 1s */
-#define CONSUMER_BATCH_SIZE 1000
+#define KAFKA_META_TIMEOUT 1000 /* 1s */
 
 #define OPTION_DELIMITER "delimiter"
 #define OPTION_FORMAT "format"
@@ -103,10 +104,79 @@ PG_MODULE_MAGIC;
 
 static volatile sig_atomic_t got_sigterm = false;
 static rd_kafka_t *MyKafka = NULL;
-static slock_t elog_mutex;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 void _PG_init(void);
+
+typedef struct error_buf_t
+{
+	Size             size;
+	pg_atomic_uint32 offset;
+	char            *bytes;
+	slock_t          mutex;
+} error_buf_t;
+
+#define ERROR_BUF_SIZE 4096
+static error_buf_t my_error_buf;
+
+static void
+error_buf_init(error_buf_t *ebuf, Size size)
+{
+	MemSet(ebuf, 0, sizeof(error_buf_t));
+
+	ebuf->size = size;
+	ebuf->bytes = palloc0(size);
+
+	pg_atomic_init_u32(&ebuf->offset, 0);
+	SpinLockInit(&ebuf->mutex);
+}
+
+static bool
+error_buf_push(error_buf_t *ebuf, const char *str)
+{
+	bool success = false;
+	int len = strlen(str) + 1; /* for \n */
+	uint32 offset;
+
+	SpinLockAcquire(&ebuf->mutex);
+
+	offset = pg_atomic_read_u32(&ebuf->offset);
+
+	if (ebuf->size - offset > len)
+	{
+		char *pos = &ebuf->bytes[offset];
+		memcpy(pos, str, len);
+		offset += len;
+		Assert(offset <= ebuf->size);
+		pg_atomic_write_u32(&ebuf->offset, offset);
+		success = true;
+	}
+
+	SpinLockRelease(&ebuf->mutex);
+
+	return success;
+}
+
+static char *
+error_buf_pop(error_buf_t *ebuf)
+{
+	char *err;
+	uint32 offset = pg_atomic_read_u32(&ebuf->offset);
+
+	if (!offset)
+		return NULL;
+
+	SpinLockAcquire(&ebuf->mutex);
+
+	offset = pg_atomic_read_u32(&ebuf->offset);
+	err = palloc(offset);
+	memcpy(err, ebuf->bytes, offset);
+	pg_atomic_write_u32(&ebuf->offset, 0);
+
+	SpinLockRelease(&ebuf->mutex);
+
+	return err;
+}
 
 /*
  * Shared-memory state for each consumer process
@@ -147,12 +217,13 @@ typedef struct KafkaConsumer
 	RangeVar *rel;
 	int32_t partition;
 	int64_t offset;
-	size_t batch_size;
+	int batch_size;
+	int parallelism;
+	int timeout;
 	char *format;
 	char *delimiter;
 	char *quote;
 	char *escape;
-	int parallelism;
 	int num_partitions;
 	int64_t *offsets;
 } KafkaConsumer;
@@ -317,9 +388,7 @@ relinfo_delete(ResultRelInfo *rinfo, ItemPointer tid)
 static void
 consumer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
-	SpinLockAcquire(&elog_mutex);
-	elog(LOG, "[kafka consumer]: %s", buf);
-	SpinLockRelease(&elog_mutex);
+	error_buf_push(&my_error_buf, buf);
 }
 
 /*
@@ -514,11 +583,18 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	MemoryContextSwitchTo(old);
 
 	d = slot_getattr(slot, CONSUMER_ATTR_PARALLELISM, &isnull);
+	Assert(!isnull);
 	consumer->parallelism = DatumGetInt32(d);
 
 	/* batch size */
 	d = slot_getattr(slot, CONSUMER_ATTR_BATCH_SIZE, &isnull);
+	Assert(!isnull);
 	consumer->batch_size = DatumGetInt32(d);
+
+	/* timeout */
+	d = slot_getattr(slot, CONSUMER_ATTR_TIMEOUT, &isnull);
+	Assert(!isnull);
+	consumer->timeout = DatumGetInt32(d);
 
 	ExecDropSingleTupleTableSlot(slot);
 	index_endscan(scan);
@@ -766,7 +842,8 @@ kafka_consume_main(Datum arg)
 	/* give this proc access to the database */
 	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
 
-	SpinLockInit(&elog_mutex);
+	/* set up error buffer */
+	error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
 
 	/* load saved consumer state */
 	StartTransactionCommand();
@@ -793,7 +870,7 @@ kafka_consume_main(Datum arg)
 	 * Set up our topic to read from
 	 */
 	topic = rd_kafka_topic_new(kafka, consumer.topic, topic_conf);
-	err = rd_kafka_metadata(kafka, false, topic, &meta, CONSUMER_TIMEOUT);
+	err = rd_kafka_metadata(kafka, false, topic, &meta, KAFKA_META_TIMEOUT);
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
 		elog(ERROR, "failed to acquire metadata: %s", rd_kafka_err2str(err));
@@ -814,8 +891,8 @@ kafka_consume_main(Datum arg)
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		elog(LOG, "[kafka consumer] %s <- %s consuming partition %d from offset %ld",
-				consumer.rel->relname, consumer.topic, partition, consumer.offsets[partition]);
+		elog(LOG, "[kafka consumer] %s <- %s consuming partition %d from offset %ld %d",
+				consumer.rel->relname, consumer.topic, partition, consumer.offsets[partition], MyProcPid);
 
 		if (rd_kafka_consume_start(topic, partition, consumer.offsets[partition]) == -1)
 			elog(ERROR, "failed to start consuming: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
@@ -844,10 +921,11 @@ kafka_consume_main(Datum arg)
 	 */
 	while (!got_sigterm)
 	{
-		ssize_t num_consumed;
+		int num_consumed;
 		int i;
 		int messages_buffered = 0;
 		int partition;
+		char *librdkerrs;
 		StringInfo buf;
 
 		MemoryContextSwitchTo(work_ctx);
@@ -861,7 +939,7 @@ kafka_consume_main(Datum arg)
 				continue;
 
 			num_consumed = rd_kafka_consume_batch(topic, partition,
-					CONSUMER_TIMEOUT, messages, consumer.batch_size);
+					consumer.timeout, messages, consumer.batch_size);
 
 			if (num_consumed <= 0)
 				continue;
@@ -870,17 +948,14 @@ kafka_consume_main(Datum arg)
 			{
 				Assert(messages[i]);
 
-				if (messages[i]->err != RD_KAFKA_RESP_ERR_NO_ERROR)
+				if (messages[i]->err)
 				{
 					/* Ignore partition EOF internal error */
 					if (messages[i]->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
 						elog(LOG, "[kafka consumer] %s <- %s consumer error %s",
 								consumer.rel->relname, consumer.topic, rd_kafka_err2str(messages[i]->err));
-
-					continue;
 				}
-
-				if (messages[i]->len > 0)
+				else if (messages[i]->len > 0)
 				{
 					appendBinaryStringInfo(buf, messages[i]->payload, messages[i]->len);
 
@@ -889,15 +964,19 @@ kafka_consume_main(Datum arg)
 						appendStringInfoChar(buf, '\n');
 
 					messages_buffered++;
+
+					Assert(messages[i]->offset >= consumer.offsets[partition]);
+					consumer.offsets[partition] = messages[i]->offset;
 				}
 
-				Assert(messages[i]->offset >= consumer.offsets[partition]);
-
-				consumer.offsets[partition] = messages[i]->offset;
 				rd_kafka_message_destroy(messages[i]);
 				messages[i] = NULL;
 			}
 		}
+
+		librdkerrs = error_buf_pop(&my_error_buf);
+		if (librdkerrs)
+			elog(LOG, "[pipeline_kafka consumer]: %s", librdkerrs);
 
 		if (messages_buffered == 0)
 		{
@@ -937,7 +1016,7 @@ done:
 
 	rd_kafka_topic_destroy(topic);
 	rd_kafka_destroy(kafka);
-	rd_kafka_wait_destroyed(CONSUMER_TIMEOUT);
+	rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
 }
 
 /*
@@ -947,7 +1026,7 @@ done:
  */
 static int32
 create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
-		text *format, text *delimiter, text *quote, text *escape, int batchsize, int parallelism)
+		text *format, text *delimiter, text *quote, text *escape, int batchsize, int parallelism, int timeout)
 {
 	HeapTuple tup;
 	Datum values[CONSUMER_RELATION_NATTS];
@@ -969,6 +1048,7 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 
 	values[CONSUMER_ATTR_BATCH_SIZE - 1] = Int32GetDatum(batchsize);
 	values[CONSUMER_ATTR_PARALLELISM - 1] = Int32GetDatum(parallelism);
+	values[CONSUMER_ATTR_TIMEOUT - 1] = Int32GetDatum(timeout);
 	values[CONSUMER_ATTR_FORMAT - 1] = PointerGetDatum(format);
 
 	if (delimiter == NULL)
@@ -1172,6 +1252,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	text *escape;
 	int batchsize;
 	int parallelism;
+	int timeout;
 	int64 offset;
 	KafkaConsumer consumer;
 
@@ -1223,9 +1304,14 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 		parallelism = PG_GETARG_INT32(7);
 
 	if (PG_ARGISNULL(8))
+		timeout = 250;
+	else
+		timeout = PG_GETARG_INT32(8);
+
+	if (PG_ARGISNULL(9))
 		offset = RD_KAFKA_OFFSET_NULL;
 	else
-		offset = PG_GETARG_INT64(8);
+		offset = PG_GETARG_INT64(9);
 
 	/* there's no point in progressing if there aren't any brokers */
 	if (!get_all_brokers())
@@ -1244,7 +1330,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 	id = create_or_update_consumer(consumers, qualified_name, topic, format,
-			delimiter, quote, escape, batchsize, parallelism);
+			delimiter, quote, escape, batchsize, parallelism, timeout);
 	load_consumer_state(id, &consumer);
 	success = launch_consumer_group(&consumer, offset);
 	relinfo_close(consumers, NoLock);
@@ -1490,9 +1576,7 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 static void
 producer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
-	SpinLockAcquire(&elog_mutex);
-	elog(LOG, "[kafka producer]: %s", buf);
-	SpinLockRelease(&elog_mutex);
+	error_buf_push(&my_error_buf, buf);
 }
 
 PG_FUNCTION_INFO_V1(kafka_produce_msg);
@@ -1507,6 +1591,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	int32 partition;
 	char *key;
 	int keylen;
+	char *librdkerrs;
 
 	check_pipeline_kafka_preloaded();
 
@@ -1520,6 +1605,8 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		if (list_length(brokers) == 0)
 			elog(ERROR, "no valid brokers were found");
 
+		error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
+
 		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, err_msg, sizeof(err_msg));
 		rd_kafka_set_logger(kafka, producer_logger);
 
@@ -1529,11 +1616,10 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		if (valid_brokers == 0)
 		{
 			rd_kafka_destroy(kafka);
-			rd_kafka_wait_destroyed(CONSUMER_TIMEOUT);
+			rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
 			elog(ERROR, "no valid brokers were found");
 		}
 
-		SpinLockInit(&elog_mutex);
 		MyKafka = kafka;
 	}
 
@@ -1569,6 +1655,10 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		elog(ERROR, "failed to produce message: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 	rd_kafka_poll(MyKafka, 0);
+
+	librdkerrs = error_buf_pop(&my_error_buf);
+	if (librdkerrs)
+		elog(LOG, "[pipeline_kafka producer]: %s", librdkerrs);
 
 	RETURN_SUCCESS();
 }
