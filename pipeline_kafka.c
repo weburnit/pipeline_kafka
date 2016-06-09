@@ -102,7 +102,10 @@ PG_MODULE_MAGIC;
 
 #define RD_KAFKA_OFFSET_NULL INT64_MIN
 
-static volatile sig_atomic_t got_sigterm = false;
+#define CONSUMER_LOG_PREFIX "[pipeline_kafka consumer] %s <- %s (PID %d): "
+#define CONSUMER_WORKER_RESTART_TIME 1
+
+static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
@@ -314,7 +317,7 @@ kafka_consume_main_sigterm(SIGNAL_ARGS)
 {
 	int save_errno = errno;
 
-	got_sigterm = true;
+	got_SIGTERM = true;
 	if (MyLatch)
 		SetLatch(MyLatch);
 
@@ -810,8 +813,8 @@ kafka_consume_main(Datum arg)
 {
 	char err_msg[512];
 	rd_kafka_topic_conf_t *topic_conf;
-	rd_kafka_t *kafka;
-	rd_kafka_topic_t *topic;
+	rd_kafka_t *kafka = NULL;
+	rd_kafka_topic_t *topic = NULL;
 	rd_kafka_message_t **messages;
 	const struct rd_kafka_metadata *meta;
 	struct rd_kafka_metadata_topic topic_meta;
@@ -828,7 +831,10 @@ kafka_consume_main(Datum arg)
 	MemoryContext work_ctx;
 
 	if (!found)
-		elog(ERROR, "[pipeline_kafka consumer (%d)] consumer process entry %d not found", MyProcPid, id);
+	{
+		elog(WARNING, "[kafka consumer] (PID %d) consumer process entry %d not found", MyProcPid, id);
+		goto done;
+	}
 
 	pqsignal(SIGTERM, kafka_consume_main_sigterm);
 #define BACKTRACE_SEGFAULTS
@@ -858,13 +864,18 @@ kafka_consume_main(Datum arg)
 	 * Add all brokers currently in pipeline_kafka.brokers
 	 */
 	if (consumer.brokers == NIL)
-		elog(ERROR, "[pipeline_kafka consumer (%d)] no valid brokers were found", MyProcPid);
+	{
+		elog(WARNING, CONSUMER_LOG_PREFIX "no brokers found in pipeline_kafka.brokers",
+				consumer.rel->relname, consumer.topic, MyProcPid);
+		goto done;
+	}
 
 	foreach(lc, consumer.brokers)
 		valid_brokers += rd_kafka_brokers_add(kafka, lfirst(lc));
 
 	if (!valid_brokers)
-		elog(ERROR, "[pipeline_kafka consumer (%d)] no valid brokers were found", MyProcPid);
+		elog(ERROR, CONSUMER_LOG_PREFIX "no valid brokers were found",
+				consumer.rel->relname, consumer.topic, MyProcPid);
 
 	/*
 	 * Set up our topic to read from
@@ -873,7 +884,8 @@ kafka_consume_main(Datum arg)
 	err = rd_kafka_metadata(kafka, false, topic, &meta, KAFKA_META_TIMEOUT);
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
-		elog(ERROR, "failed to acquire metadata: %s", rd_kafka_err2str(err));
+		elog(ERROR, CONSUMER_LOG_PREFIX "failed to acquire metadata: %s",
+				consumer.rel->relname, consumer.topic, MyProcPid, rd_kafka_err2str(err));
 
 	Assert(meta->topic_cnt == 1);
 	topic_meta = meta->topics[0];
@@ -891,11 +903,12 @@ kafka_consume_main(Datum arg)
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		elog(LOG, "[pipeline_kafka consumer (%d)] %s <- %s consuming partition %d from offset %ld",
-				MyProcPid, consumer.rel->relname, consumer.topic, partition, consumer.offsets[partition]);
+		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
+				consumer.rel->relname, consumer.topic, MyProcPid, partition, consumer.offsets[partition]);
 
 		if (rd_kafka_consume_start(topic, partition, consumer.offsets[partition]) == -1)
-			elog(ERROR, "failed to start consuming: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
+			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
+					consumer.rel->relname, consumer.topic, MyProcPid, rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 		my_partitions++;
 	}
@@ -905,8 +918,8 @@ kafka_consume_main(Datum arg)
 	*/
 	if (my_partitions == 0)
 	{
-		elog(LOG, "[pipeline_kafka consumer (%d)] %s <- %s consumer %d doesn't have any partitions to read from",
-				MyProcPid, consumer.rel->relname, consumer.topic, MyProcPid);
+		elog(LOG, CONSUMER_LOG_PREFIX "no partitions to read from",
+				consumer.rel->relname, consumer.topic, MyProcPid);
 		goto done;
 	}
 
@@ -919,7 +932,7 @@ kafka_consume_main(Datum arg)
 	/*
 	 * Consume messages until we are terminated
 	 */
-	while (!got_sigterm)
+	while (!got_SIGTERM)
 	{
 		int num_consumed;
 		int i;
@@ -952,8 +965,8 @@ kafka_consume_main(Datum arg)
 				{
 					/* Ignore partition EOF internal error */
 					if (messages[i]->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
-						elog(LOG, "[pipeline_kafka consumer (%d)] %s <- %s consumer error %s",
-								MyProcPid, consumer.rel->relname, consumer.topic, rd_kafka_err2str(messages[i]->err));
+						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+								consumer.rel->relname, consumer.topic, MyProcPid, rd_kafka_err2str(messages[i]->err));
 				}
 				else if (messages[i]->len > 0)
 				{
@@ -976,9 +989,10 @@ kafka_consume_main(Datum arg)
 
 		librdkerrs = error_buf_pop(&my_error_buf);
 		if (librdkerrs)
-			elog(LOG, "[pipeline_kafka consumer (%d)]: %s", MyProcPid, librdkerrs);
+			elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+					consumer.rel->relname, consumer.topic, MyProcPid, librdkerrs);
 
-		if (messages_buffered == 0)
+		if (!messages_buffered)
 		{
 			pg_usleep(1000);
 			continue;
@@ -994,8 +1008,8 @@ kafka_consume_main(Datum arg)
 		}
 		PG_CATCH();
 		{
-			elog(LOG, "[pipeline_kafka consumer (%d)] %s <- %s failed to process batch, dropped %d message%s:",
-					MyProcPid, consumer.rel->relname, consumer.topic, messages_buffered, (messages_buffered == 1 ? "" : "s"));
+			elog(LOG, CONSUMER_LOG_PREFIX "failed to process batch, dropped %d message%s",
+					consumer.rel->relname, consumer.topic, MyProcPid, messages_buffered, (messages_buffered == 1 ? "" : "s"));
 			EmitErrorReport();
 			FlushErrorState();
 
@@ -1014,9 +1028,13 @@ kafka_consume_main(Datum arg)
 done:
 	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 
-	rd_kafka_topic_destroy(topic);
-	rd_kafka_destroy(kafka);
-	rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+	if (kafka)
+	{
+		if (topic)
+			rd_kafka_topic_destroy(topic);
+		rd_kafka_destroy(kafka);
+		rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+	}
 }
 
 /*
@@ -1211,7 +1229,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		worker.bgw_main_arg = Int32GetDatum(id);
 		worker.bgw_flags = BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_SHMEM_ACCESS;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		worker.bgw_restart_time = BGW_NEVER_RESTART;
+		worker.bgw_restart_time = CONSUMER_WORKER_RESTART_TIME;
 		worker.bgw_main = NULL;
 		worker.bgw_notify_pid = 0;
 
