@@ -1671,7 +1671,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 
 	if (rd_kafka_produce(topic, partition, RD_KAFKA_MSG_F_COPY, VARDATA_ANY(msg), VARSIZE_ANY_EXHDR(msg),
 			key, keylen, NULL) == -1)
-		elog(ERROR, "failed to produce message: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		elog(ERROR, "failed to produce message (size %ld): %s", VARSIZE_ANY_EXHDR(msg), rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 	rd_kafka_poll(MyKafka, 0);
 
