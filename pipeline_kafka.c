@@ -1370,11 +1370,6 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	relname = makeRangeVarFromNameList(textToQualifiedNameList(qualified_name));
 	rel = heap_openrv(relname, AccessShareLock);
 
-	if (IsInferredStream(RelationGetRelid(rel)))
-		ereport(ERROR,
-				(errmsg("target stream must be static"),
-				errhint("Use CREATE STREAM to create a stream that can consume a Kafka topic.")));
-
 	heap_close(rel, NoLock);
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
