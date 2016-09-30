@@ -2,13 +2,13 @@ version: '2'
 services:
   zookeeper:
     image: wurstmeister/zookeeper
-    container_name: zookeeper
+    container_name: pipeline_kafka_zookeeper
     network_mode: host
     ports:
       - "2181:2181"
   kafka0:
     image: wurstmeister/kafka:0.8.2.2
-    container_name: broker0
+    container_name: pipeline_kafka_broker0
     network_mode: host
     environment:
       KAFKA_PORT: 9092
@@ -22,7 +22,7 @@ services:
   kafka1:
     extends:
       service: kafka0
-    container_name: broker1
+    container_name: pipeline_kafka_broker1
     ports:
       - "8092:9092"
     environment:
@@ -34,4 +34,3 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: localhost:2181
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-
