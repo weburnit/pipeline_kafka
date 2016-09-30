@@ -7,7 +7,7 @@ PipelineDB extension for Kafka support
 You'll need to have [librdkafka](https://github.com/edenhill/librdkafka) installed on your system to build the extension. The easiest way to install it is to built it from source.
 
 ```
-git clone -b 0.8 https://github.com/edenhill/librdkafka.git ~/librdkafka
+git clone -b 0.9.1 https://github.com/edenhill/librdkafka.git ~/librdkafka
 cd ~/librdkafka
 ./configure --prefix=/usr
 make
@@ -29,7 +29,7 @@ make install
 `pipeline_kafka` internally uses shared memory to sync state between background workers, so it must be preloaded as a shared library. You can do so by adding the following line to your `pipelinedb.conf` file. If you're already loading some shared libraries, then simply add `pipeline_kafka` as a comma-separated list.
 
 ```
-shared_preload_libraries = pipeline_kafka
+shared_preload_libraries = 'pipeline_kafka'
 ```
 
 Now you can load the extension into a database:
