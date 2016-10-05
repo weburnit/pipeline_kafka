@@ -1239,6 +1239,8 @@ kafka_consume_main(Datum arg)
 	char errstr[512];
 	char val[64];
 
+	MemSet(&consumer, 0, sizeof(KafkaConsumer));
+
 	if (!found)
 	{
 		elog(WARNING, "[kafka consumer] (PID %d) consumer process entry %d not found", MyProcPid, id);
