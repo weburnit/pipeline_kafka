@@ -1240,6 +1240,7 @@ kafka_consume_main(Datum arg)
 	char val[64];
 
 	MemSet(&consumer, 0, sizeof(KafkaConsumer));
+	MemSet(&topic_meta, 0, sizeof(struct rd_kafka_metadata_topic));
 
 	if (!found)
 	{
