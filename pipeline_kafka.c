@@ -1272,6 +1272,8 @@ kafka_consume_main(Datum arg)
 	rd_kafka_topic_conf_set(topic_conf, "fetch.message.max.bytes", val, errstr, sizeof(errstr));
 
 	conf = rd_kafka_conf_new();
+	rd_kafka_conf_set_log_cb(conf, consumer_logger);
+
 	if (broker_version)
 		rd_kafka_conf_set(conf, "broker.version.fallback", broker_version, NULL, 0);
 
@@ -2019,6 +2021,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	{
 		ListCell *lc;
 		int valid_brokers = 0;
+		rd_kafka_conf_t *conf;
 		rd_kafka_t *kafka;
 		List *brokers = get_all_brokers();
 
@@ -2027,8 +2030,10 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 
 		error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
 
+		conf = rd_kafka_conf_new();
+		rd_kafka_conf_set_log_cb(conf, producer_logger);
+
 		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, err_msg, sizeof(err_msg));
-		rd_kafka_set_logger(kafka, producer_logger);
 
 		foreach(lc, brokers)
 			valid_brokers += rd_kafka_brokers_add(kafka, lfirst(lc));
