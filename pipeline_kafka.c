@@ -795,7 +795,7 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
  * Get the COPY statement that will be used to write messages to a stream
  */
 static CopyStmt *
-get_copy_statement(KafkaConsumer *consumer)
+get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 {
 	MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
 	CopyStmt *stmt = makeNode(CopyStmt);
@@ -811,7 +811,10 @@ get_copy_statement(KafkaConsumer *consumer)
 	stmt->query = NULL;
 	stmt->attlist = NIL;
 
-	rel = heap_openrv(consumer->rel, AccessShareLock);
+	rel = heap_openrv_extended(consumer->rel, AccessShareLock, missing_ok);
+	if (!rel)
+		return NULL;
+
 	desc = RelationGetDescr(rel);
 
 	for (i = 0; i < desc->natts; i++)
@@ -914,7 +917,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 	MemoryContext work_ctx = CurrentMemoryContext;
 
 	StartTransactionCommand();
-	copy = get_copy_statement(consumer);
+	copy = get_copy_statement(consumer, false);
 	CommitTransactionCommand();
 
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
@@ -1092,7 +1095,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
 								CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(message->err));
 				}
-				else if (message->len)
+				else if (message->key_len && message->len)
 				{
 					char *key;
 					per_stream_state *state;
@@ -1110,9 +1113,8 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 					if (!found)
 					{
 						MemoryContext old;
-						List *name_list;
 
-						name_list = textToQualifiedNameList(cstring_to_text(key));
+						MemSet(state, 0, sizeof(per_stream_state));
 
 						old = MemoryContextSwitchTo(CacheMemoryContext);
 
@@ -1120,16 +1122,35 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 						state->buf = makeStringInfo();
 						state->num_messages = 0;
 
+						MemoryContextSwitchTo(old);
+					}
+
+					/*
+					 * If we don't have a copy statement, try to get one. We mark get_copy_statement as missing_ok, so even if
+					 * the relation is missing, we don't blow up
+					 */
+					if (!state->copy)
+					{
+						MemoryContext old;
+						List *name_list;
+
+						name_list = textToQualifiedNameList(cstring_to_text(key));
+
+						old = MemoryContextSwitchTo(CacheMemoryContext);
+
 						consumer->rel = makeRangeVarFromNameList(name_list);
 
 						StartTransactionCommand();
-						state->copy = get_copy_statement(consumer);
+						state->copy = get_copy_statement(consumer, true);
 						CommitTransactionCommand();
 
 						consumer->rel = NULL;
 
 						MemoryContextSwitchTo(old);
 					}
+
+					if (!state->copy)
+						continue;
 
 					buf = state->buf;
 
