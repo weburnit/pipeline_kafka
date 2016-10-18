@@ -1150,22 +1150,27 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 					}
 
 					if (!state->copy)
-						continue;
+					{
+						elog(WARNING, CONSUMER_LOG_PREFIX "skipping message, relation missing: \"%s\"",
+								CONSUMER_LOG_PREFIX_PARAMS(consumer), key);
+					}
+					else
+					{
+						buf = state->buf;
 
-					buf = state->buf;
+						appendBinaryStringInfo(buf, message->payload, message->len);
 
-					appendBinaryStringInfo(buf, message->payload, message->len);
+						/* COPY expects a newline after each tuple, so add one if missing. */
+						if (buf->data[buf->len - 1] != '\n')
+							appendStringInfoChar(buf, '\n');
 
-					/* COPY expects a newline after each tuple, so add one if missing. */
-					if (buf->data[buf->len - 1] != '\n')
-						appendStringInfoChar(buf, '\n');
+						state->num_messages++;
+						messages_buffered++;
+						bytes_buffered += message->len;
 
-					state->num_messages++;
-					messages_buffered++;
-					bytes_buffered += message->len;
-
-					Assert(message->offset >= consumer->offsets[partition]);
-					consumer->offsets[partition] = message->offset;
+						Assert(message->offset >= consumer->offsets[partition]);
+						consumer->offsets[partition] = message->offset;
+					}
 				}
 
 				rd_kafka_message_destroy(message);
@@ -1313,7 +1318,6 @@ kafka_consume_main(Datum arg)
 		configure_consumer(conf, topic_conf);
 
 	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
-	rd_kafka_set_logger(consumer.kafka, consumer_logger);
 
 	/*
 	 * Add all brokers currently in pipeline_kafka.brokers

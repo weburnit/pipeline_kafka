@@ -472,7 +472,7 @@ def kafka(request):
   return kafka
 
 
-def eventually(fn, timeout=120, interval=0.01):
+def eventually(fn, timeout=30, interval=0.1):
   """
   Keep calling fn until it returns true or a timeout is reached, sleeping
   for the given interval after each failed attempt

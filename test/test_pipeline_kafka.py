@@ -1,6 +1,5 @@
 from base import kafka, pipeline, clean_db, eventually
 import json
-import subprocess
 import threading
 import time
 
@@ -140,6 +139,33 @@ def test_consume_stream_partitioned(pipeline, kafka, clean_db):
       assert rows and rows[0][0] == 100
 
   assert eventually(messages_partitioned)
+  pipeline.consume_end()
+
+
+def test_consume_stream_partitioned_safety(pipeline, kafka, clean_db):
+  '''
+  Produce without a key or non-existent stream key and make sure
+  thing work properly
+  '''
+  pipeline.create_stream('stream', x='integer')
+  pipeline.create_cv('cv', 'SELECT count(*) FROM stream')
+
+  kafka.create_topic('stream_partitioned_topic_safe')
+  pipeline.consume_begin_stream_partitioned('stream_partitioned_topic_safe')
+
+
+  producer = kafka.get_producer('stream_partitioned_topic_safe')
+  for n in range(100):
+    producer.produce(str(n), partition_key='')
+    producer.produce(str(n), partition_key='invalid')
+    producer.produce(str(n), partition_key='stream')
+
+  def messages_partitioned():
+    rows = pipeline.execute('SELECT count FROM cv')
+    assert rows and rows[0][0] == 100
+
+  assert eventually(messages_partitioned)
+  pipeline.consume_end()
 
 
 def test_consume_text(pipeline, kafka, clean_db):

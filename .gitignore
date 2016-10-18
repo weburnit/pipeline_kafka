@@ -37,3 +37,6 @@ config.log
 .*project*
 .settings/
 *~
+
+.kafka/
+.pdb*/
