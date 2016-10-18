@@ -431,7 +431,7 @@ get_all_brokers(void)
 {
 	HeapTuple tup = NULL;
 	HeapScanDesc scan;
-	ResultRelInfo *brokers = relinfo_open(get_rangevar(BROKER_RELATION), ExclusiveLock);
+	ResultRelInfo *brokers = relinfo_open(get_rangevar(BROKER_RELATION), AccessShareLock);
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(brokers->ri_RelationDesc));
 	List *result = NIL;
 
