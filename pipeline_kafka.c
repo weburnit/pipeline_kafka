@@ -2083,12 +2083,12 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	topic_name = text_to_cstring(PG_GETARG_TEXT_P(0));
 	msg = PG_GETARG_BYTEA_P(1);
 
-	if (PG_ARGISNULL(2))
+	if (PG_NARGS() < 3 || PG_ARGISNULL(2))
 		partition = RD_KAFKA_PARTITION_UA;
 	else
 		partition = PG_GETARG_INT32(2);
 
-	if (PG_ARGISNULL(3))
+	if (PG_NARGS() < 4 || PG_ARGISNULL(3))
 	{
 		key = NULL;
 		keylen = 0;
