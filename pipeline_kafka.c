@@ -2057,8 +2057,10 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 
 		conf = rd_kafka_conf_new();
 		rd_kafka_conf_set_log_cb(conf, producer_logger);
+		if (broker_version)
+			rd_kafka_conf_set(conf, "broker.version.fallback", broker_version, NULL, 0);
 
-		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, err_msg, sizeof(err_msg));
+		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, conf, err_msg, sizeof(err_msg));
 
 		foreach(lc, brokers)
 			valid_brokers += rd_kafka_brokers_add(kafka, lfirst(lc));

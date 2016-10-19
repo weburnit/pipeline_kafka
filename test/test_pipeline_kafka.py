@@ -343,3 +343,27 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
   # Verify that offsets still aren't stored locally
   rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
   assert not rows
+
+
+def test_produce(pipeline, kafka, clean_db):
+  """
+  Tests pipeline_kafka.emit_tuple and pipeline_kafka.produce_message
+  """
+  pipeline.create_stream('stream', payload='json')
+  pipeline.create_cv('cv', 'SELECT payload FROM stream')
+  pipeline.create_table('t', x='integer', y='integer')
+  pipeline.execute("""CREATE TRIGGER tg AFTER INSERT ON t
+    FOR EACH ROW EXECUTE PROCEDURE pipeline_kafka.emit_tuple('topic')
+    """)
+
+  kafka.create_topic('topic', partitions=4)
+  pipeline.consume_begin('topic', 'stream')
+
+  for i in range(100):
+    pipeline.insert('t', ('x', 'y'), [(i, 2 * i)])
+
+  def messages():
+    rows = pipeline.execute('SELECT * FROM cv')
+    assert len(rows) == 100
+
+  assert eventually(messages)

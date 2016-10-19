@@ -213,7 +213,7 @@ class PipelineDB(object):
     Create a table
     """
     cols = ', '.join(['%s %s' % (k, v) for k, v in cols.iteritems()])
-    self.execute('CREATE TABLE %s (%s)' % (name, cols))
+    self.execute('CREATE TABLE "%s" (%s)' % (name, cols))
 
   def create_stream(self, name, **cols):
     """
@@ -249,10 +249,13 @@ class PipelineDB(object):
     cur = self.conn.cursor()
     cur.execute(stmt)
 
-    if cur.rowcount < 0:
+    if cur.rowcount <= 0:
       return []
 
-    return cur.fetchall()
+    try:
+      return cur.fetchall()
+    except psycopg2.ProgrammingError:
+      return []
 
   def insert(self, target, desc, rows):
     """
