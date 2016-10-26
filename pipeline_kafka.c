@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "access/skey.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pipeline_stream_fn.h"
@@ -1271,6 +1272,12 @@ kafka_consume_main(Datum arg)
 	if (!found)
 	{
 		elog(WARNING, "[kafka consumer] (PID %d) consumer process entry %d not found", MyProcPid, id);
+		goto done;
+	}
+
+	if (RecoveryInProgress())
+	{
+		elog(WARNING, "[kafka consumer] (PID %d) cannot cannot consume from Kafka during recovery", MyProcPid);
 		goto done;
 	}
 
