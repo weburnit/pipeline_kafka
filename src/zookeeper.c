@@ -276,3 +276,19 @@ is_zk_lock_held(zk_lock_t *lock)
 
   return false;
 }
+
+/*
+ * zk_close
+ */
+void
+zk_close(void)
+{
+	int rc;
+
+	if (!zk)
+		return;
+
+	rc = zookeeper_close(zk);
+	if (rc != ZOK)
+		elog(WARNING, "zk_close failed with return code %d", rc);
+}

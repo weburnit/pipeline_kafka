@@ -1476,6 +1476,9 @@ done:
 		elog(LOG, CONSUMER_LOG_PREFIX "stopped consuming partition %d", CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition);
 	}
 
+	if (consumer.group_id)
+		zk_close();
+
 	if (consumer.kafka)
 	{
 		if (consumer.topic)
