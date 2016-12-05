@@ -11,11 +11,11 @@ def test_basic(pipeline, kafka, clean_db):
   Produce and consume several topics into several streams and verify that
   all resulting data is correct
   """
-  pipeline.create_stream('stream', x='integer')
-  pipeline.create_cv('basic', 'SELECT x, COUNT(*) FROM stream GROUP BY x')
+  pipeline.create_stream('stream0', x='integer')
+  pipeline.create_cv('basic', 'SELECT x, COUNT(*) FROM stream0 GROUP BY x')
 
   kafka.create_topic('test_basic')
-  pipeline.consume_begin('test_basic', 'stream')
+  pipeline.consume_begin('test_basic', 'stream0')
 
   producer = kafka.get_producer('test_basic')
   for n in range(1000):
@@ -35,11 +35,11 @@ def test_consumers(pipeline, kafka, clean_db):
   """
   Verify that offsets are properly maintained when storing them locally across consumer restarts
   """
-  pipeline.create_stream('stream', x='integer')
-  pipeline.create_cv('basic', 'SELECT x, COUNT(*) FROM stream GROUP BY x')
+  pipeline.create_stream('stream0', x='integer')
+  pipeline.create_cv('basic', 'SELECT x, COUNT(*) FROM stream0 GROUP BY x')
 
   kafka.create_topic('test_consumers', partitions=4)
-  pipeline.consume_begin('test_consumers', 'stream', parallelism=4)
+  pipeline.consume_begin('test_consumers', 'stream0', parallelism=4)
 
   producer = kafka.get_producer('test_consumers')
   for n in range(1000):
@@ -75,7 +75,7 @@ def test_consumers(pipeline, kafka, clean_db):
   for n in range(1000):
     producer.produce(str(n))
 
-  pipeline.consume_begin('test_consumers', 'stream', parallelism=4)
+  pipeline.consume_begin('test_consumers', 'stream0', parallelism=4)
   time.sleep(2)
 
   # Verify count
@@ -107,7 +107,7 @@ def test_consumers(pipeline, kafka, clean_db):
 
 def test_consume_stream_partitioned(pipeline, kafka, clean_db):
   """
-  Verify that messages with a stream name as their partition key
+  Verify that messages with a stream0 name as their partition key
   are properly mapped to streams
   """
   for n in range(4):
@@ -123,7 +123,7 @@ def test_consume_stream_partitioned(pipeline, kafka, clean_db):
 
   threads = []
   for n in range(4):
-    stream = 'stream%d' % n
+    stream0 = 'stream%d' % n
     producer = kafka.get_producer('stream_partitioned_topic')
     t = threading.Thread(target=produce, args=(producer, stream))
     t.daemon = True
@@ -433,18 +433,18 @@ def test_grouped_consumer_session_loss(kafka):
   pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
   pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
 
-  pdb0.create_stream('stream', x='integer')
-  pdb0.create_cv('count', "SELECT x, COUNT(*) FROM stream GROUP BY x")
+  pdb0.create_stream('stream0', x='integer')
+  pdb0.create_cv('count', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
 
-  pdb1.create_stream('stream', x='integer')
-  pdb1.create_cv('count', "SELECT x, COUNT(*) FROM stream GROUP BY x")
+  pdb1.create_stream('stream0', x='integer')
+  pdb1.create_cv('count', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
 
-  pdb0.consume_begin('topic', 'stream', group_id='session')
+  pdb0.consume_begin('topic', 'stream0', group_id='session')
 
   # Let pdb0 take the lock
   time.sleep(5)
 
-  pdb1.consume_begin('topic', 'stream', group_id='session')
+  pdb1.consume_begin('topic', 'stream0', group_id='session')
 
   producer = kafka.get_producer('topic')
 
