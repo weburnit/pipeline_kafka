@@ -824,7 +824,7 @@ get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 		 * Users can't supply values for arrival_timestamp, so make
 		 * sure we exclude it from the copy attr list
 		 */
-		char *name = NameStr(desc->attrs[i]->attname);
+		char *name = pstrdup(NameStr(desc->attrs[i]->attname));
 		if (IsStream(RelationGetRelid(rel)) && pg_strcasecmp(name, ARRIVAL_TIMESTAMP) == 0)
 			continue;
 		stmt->attlist = lappend(stmt->attlist, makeString(name));
