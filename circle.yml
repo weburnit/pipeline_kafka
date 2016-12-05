@@ -17,6 +17,7 @@ dependencies:
     - sudo make install
 
 test:
+  pre:
+    - sudo service postgresql stop
   override:
     - make test
-
