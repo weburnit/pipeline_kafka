@@ -123,7 +123,7 @@ def test_consume_stream_partitioned(pipeline, kafka, clean_db):
 
   threads = []
   for n in range(4):
-    stream0 = 'stream%d' % n
+    stream = 'stream%d' % n
     producer = kafka.get_producer('stream_partitioned_topic')
     t = threading.Thread(target=produce, args=(producer, stream))
     t.daemon = True
