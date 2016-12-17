@@ -1266,7 +1266,7 @@ configure_consumer(rd_kafka_conf_t *conf, rd_kafka_topic_conf_t *topic_conf)
 		k = (char *) linitial(pair);
 		v = (char *) lsecond(pair);
 
-		if (!strncmp(k, "topic.", strlen("topic.")) == 0)
+		if (strncmp(k, "topic.", strlen("topic.")) == 0)
 			rd_kafka_topic_conf_set(topic_conf, k, v, NULL, 0);
 		else
 			rd_kafka_conf_set(conf, k, v, NULL, 0);
