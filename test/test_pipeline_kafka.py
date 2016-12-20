@@ -489,3 +489,97 @@ def test_grouped_consumer_session_loss(kafka):
 
   pdb0.destroy()
   pdb1.destroy()
+
+
+def test_parallel_grouped_consumer_failover(kafka):
+  """
+  Verify that if one instance of a parallel grouped consumer is stopped
+  or fails, exactly one becomes the new active consumer.
+  """
+  kafka.create_topic('parallel_topic0', partitions=4)
+  kafka.create_topic('parallel_topic1', partitions=4)
+
+  pdb0 = PipelineDB()
+  pdb1 = PipelineDB()
+
+  pdb0.run()
+  pdb1.run()
+
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+
+  pdb0.create_stream('stream0', x='integer')
+  pdb0.create_stream('stream1', x='integer')
+  pdb0.create_cv('group0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+  pdb0.create_cv('group1', "SELECT x, COUNT(*) FROM stream1 GROUP BY x")
+
+  pdb1.create_stream('stream0', x='integer')
+  pdb1.create_stream('stream1', x='integer')
+  pdb1.create_cv('group0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+  pdb1.create_cv('group1', "SELECT x, COUNT(*) FROM stream1 GROUP BY x")
+
+  pdb0.consume_begin('parallel_topic0', 'stream0', group_id='group0', parallelism=4)
+  pdb0.consume_begin('parallel_topic1', 'stream1', group_id='group1', parallelism=4)
+
+  # Let pdb0 take the lock
+  time.sleep(5)
+
+  pdb1.consume_begin('parallel_topic0', 'stream0', group_id='group0', parallelism=4)
+  pdb1.consume_begin('parallel_topic1', 'stream1', group_id='group1', parallelism=4)
+
+  producer0 = kafka.get_producer('parallel_topic0')
+  producer1 = kafka.get_producer('parallel_topic1')
+
+  for n in range(0, 100):
+    producer0.produce(str(n))
+    producer1.produce(str(n))
+
+  def counts0():
+    rows = pdb0.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb0.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] is None
+
+    rows = pdb1.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] is None
+
+  assert eventually(counts0)
+
+  # Stop one consumer so the other one takes the lock
+  pdb0.consume_end()
+  time.sleep(10)
+
+  pdb0.consume_begin('parallel_topic0', 'stream0', group_id='group0', parallelism=4)
+  pdb0.consume_begin('parallel_topic1', 'stream1', group_id='group1', parallelism=4)
+
+  for n in range(0, 100):
+    producer0.produce(str(n))
+    producer1.produce(str(n))
+
+  def counts1():
+    rows = pdb0.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb0.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+    # Only this DB should have consumed messages this time
+    rows = pdb1.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+  assert eventually(counts1)
+
+  pdb1.consume_end()
+  pdb0.consume_end()
+
+  pdb0.destroy()
+  pdb1.destroy()
