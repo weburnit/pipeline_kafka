@@ -56,6 +56,9 @@ PG_MODULE_MAGIC;
 
 #define DEFAULT_ZK_PREFIX "/pipeline_kafka"
 
+/* The proc with partition_group 0 is responsible for lock management */
+#define IS_LOCK_PROC(proc) ((proc)->partition_group == 0)
+
 #define RETURN_SUCCESS() PG_RETURN_DATUM(CStringGetTextDatum("success"))
 #define RETURN_FAILURE() PG_RETURN_DATUM(CStringGetTextDatum("failure"))
 
@@ -220,6 +223,8 @@ typedef struct KafkaConsumerGroup
 {
 	KafkaConsumerGroupKey key;
 	int parallelism;
+	slock_t mutex;
+	TimestampTz lock_acquired;
 } KafkaConsumerGroup;
 
 /*
@@ -247,6 +252,7 @@ typedef struct KafkaConsumer
 	rd_kafka_t *kafka;
 	rd_kafka_topic_t *topic;
 	zk_lock_t *group_lock;
+	TimestampTz last_lock_check;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -938,12 +944,107 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 }
 
 static void
+set_lock_flag(KafkaConsumerGroup *group, TimestampTz lock_acquired)
+{
+	SpinLockAcquire(&group->mutex);
+	group->lock_acquired = lock_acquired;
+	SpinLockRelease(&group->mutex);
+}
+
+static bool
+get_lock_flag(KafkaConsumerGroup *group)
+{
+	bool lock_held = false;
+
+	SpinLockAcquire(&group->mutex);
+	if (!TimestampDifferenceExceeds(group->lock_acquired, GetCurrentTimestamp(), zookeeper_session_timeout))
+		lock_held = true;
+	SpinLockRelease(&group->mutex);
+
+	return lock_held;
+}
+
+/*
+ * wait_for_lock
+ *
+ * Wait until the process responsible for lock management acquires the ZK lock.
+ */
+static void
+wait_for_lock(KafkaConsumer *consumer, KafkaConsumerGroup *group)
+{
+	while (!got_SIGTERM)
+	{
+		if (get_lock_flag(group))
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000 * 1000);
+	}
+}
+
+/*
+ * is_consumer_lock_held
+ */
+static bool
+is_consumer_lock_held(KafkaConsumerGroup *group, KafkaConsumer *consumer, KafkaConsumerProc *proc)
+{
+	bool result = false;
+
+	if (IS_LOCK_PROC(proc))
+	{
+		if (is_zk_lock_held(consumer->group_lock))
+		{
+			consumer->last_lock_check = GetCurrentTimestamp();
+			set_lock_flag(group, consumer->last_lock_check);
+			result = true;
+		}
+	}
+	else
+	{
+		if (get_lock_flag(group))
+			result = true;
+	}
+
+	return result;
+}
+
+/*
+ * acquire_consumer_lock
+ */
+static void
+acquire_consumer_lock(KafkaConsumerGroup *group, KafkaConsumer *consumer, KafkaConsumerProc *proc)
+{
+	if (IS_LOCK_PROC(proc))
+	{
+		acquire_zk_lock(consumer->group_lock);
+		consumer->last_lock_check = GetCurrentTimestamp();
+		set_lock_flag(group, consumer->last_lock_check);
+	}
+	else
+	{
+		wait_for_lock(consumer, group);
+		consumer->last_lock_check = GetCurrentTimestamp();
+	}
+}
+
+static void
 consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd_kafka_topic_t *topic)
 {
 	CopyStmt *copy;
 	rd_kafka_message_t **messages;
 	MemoryContext work_ctx = CurrentMemoryContext;
-	TimestampTz last_lock_check = 0;
+	KafkaConsumerGroupKey key;
+	KafkaConsumerGroup *group;
+
+	key.db = MyDatabaseId;
+	key.consumer_id = consumer->id;
+	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_FIND, NULL);
+
+	if (!group)
+	{
+		elog(WARNING, "consumer %d has exited", consumer->id);
+		return;
+	}
 
 	StartTransactionCommand();
 	copy = get_copy_statement(consumer);
@@ -967,16 +1068,15 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		MemoryContextReset(work_ctx);
 
 		if (consumer->group_id &&
-				TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
+				TimestampDifferenceExceeds(consumer->last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
 		{
 			/*
 			 * Even if we initially acquired the consumer group lock, we need to
 			 * continuously verify that we still hold it in order to defend against
 			 * ZK session loss.
 			 */
-			if (!is_zk_lock_held(consumer->group_lock))
-				acquire_zk_lock(consumer->group_lock);
-			last_lock_check = GetCurrentTimestamp();
+			if (!is_consumer_lock_held(group, consumer, proc))
+				acquire_consumer_lock(group, consumer, proc);
 		}
 
 		buf = makeStringInfo();
@@ -1090,6 +1190,14 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 	HASHCTL ctl;
 	HTAB *stream_state_hash;
 	TimestampTz last_lock_check = 0;
+	KafkaConsumerGroupKey key;
+	KafkaConsumerGroup *group;
+
+	key.db = MyDatabaseId;
+	key.consumer_id = consumer->id;
+	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_FIND, NULL);
+
+	Assert(group);
 
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
 
@@ -1122,9 +1230,8 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 			 * continuously verify that we still hold it in order to defend against
 			 * ZK session loss.
 			 */
-			if (!is_zk_lock_held(consumer->group_lock))
-				acquire_zk_lock(consumer->group_lock);
-			last_lock_check = GetCurrentTimestamp();
+			if (!is_consumer_lock_held(group, consumer, proc))
+				acquire_consumer_lock(group, consumer, proc);
 		}
 
 		for (partition = 0; partition < consumer->num_partitions; partition++)
@@ -1337,11 +1444,14 @@ kafka_consume_main(Datum arg)
 		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
 
-		if (!zookeeper_connect)
-			elog(ERROR, "pipeline_kafka.zookeeper_connect not set");
+		if (IS_LOCK_PROC(proc))
+		{
+			if (!zookeeper_connect)
+				elog(ERROR, "pipeline_kafka.zookeeper_connect not set");
 
-		init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
-		consumer.group_lock = zk_lock_new(consumer.group_id);
+			init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
+			consumer.group_lock = zk_lock_new(consumer.group_id);
+		}
 	}
 
 	/*
@@ -1387,7 +1497,17 @@ kafka_consume_main(Datum arg)
 	CommitTransactionCommand();
 
 	if (consumer.group_id)
-		acquire_zk_lock(consumer.group_lock);
+	{
+		KafkaConsumerGroupKey key;
+		KafkaConsumerGroup *group;
+
+		key.db = MyDatabaseId;
+		key.consumer_id = consumer.id;
+
+		group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_FIND, NULL);
+		Assert(group);
+		acquire_consumer_lock(group, &consumer, proc);
+	}
 
 	StartTransactionCommand();
 	load_consumer_offsets(&consumer, &topic_meta, proc->start_offset);
@@ -1507,9 +1627,6 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	ScanKeyData skey[2];
 	IndexScanDesc scan;
 	bool isnull;
-
-	if (group_id && parallelism > 1)
-		elog(ERROR, "parallelism must be 1 when using a group_id");
 
 	if (!relation)
 		relation = cstring_to_text("");
@@ -1675,6 +1792,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 	}
 
 	group->parallelism = consumer->parallelism;
+	SpinLockInit(&group->mutex);
 
 	for (i = 0; i < group->parallelism; i++)
 	{
