@@ -264,9 +264,9 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
 
   pipeline.consume_end()
 
-  # Verify offsets aren't stored locally
+  # Verify offsets are also stored locally
   rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
-  assert not rows
+  assert rows
 
   # Now produce some more
   for n in range(1, 101):
@@ -298,10 +298,6 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
 
   assert eventually(counts_after_restart)
 
-  # Verify that offsets still aren't stored locally
-  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
-  assert not rows
-
   # Verify that we can still begin consuming from a specific offset
   pipeline.create_cv('group2', "SELECT x FROM stream0")
 
@@ -314,10 +310,6 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
     assert rows[0][0] == 196
 
   assert eventually(from_offset)
-
-  # Verify that offsets still aren't stored locally
-  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
-  assert not rows
 
 
 def test_grouped_consumer_failover(kafka):
@@ -583,3 +575,76 @@ def test_parallel_grouped_consumer_failover(kafka):
 
   pdb0.destroy()
   pdb1.destroy()
+
+
+def test_lag(pipeline, kafka, clean_db):
+  """
+  Verify that consumer lag is properly tracked
+  """
+  kafka.create_topic('lag_topic0', partitions=8)
+  kafka.create_topic('lag_topic1', partitions=4)
+
+  pipeline.create_stream('stream0', x='integer')
+  pipeline.create_cv('lag0', 'SELECT count(*) FROM stream0')
+
+  pipeline.create_stream('stream1', x='integer')
+  pipeline.create_cv('lag1', 'SELECT count(*) FROM stream1')
+
+  pipeline.consume_begin('lag_topic0', 'stream0')
+  pipeline.consume_begin('lag_topic1', 'stream1')
+
+  producer = kafka.get_producer('lag_topic0')
+  for n in range(100):
+    producer.produce(str(n), partition_key=str(n))
+
+  producer = kafka.get_producer('lag_topic1')
+  for n in range(100):
+    producer.produce(str(n), partition_key=str(n))
+
+  def counts0():
+    rows = pipeline.execute('SELECT count FROM lag0')
+    assert rows[0][0] == 100
+
+    rows = pipeline.execute('SELECT count FROM lag1')
+    assert rows[0][0] == 100
+
+  assert eventually(counts0)
+
+  pipeline.consume_end()
+
+  # Now verify there is no reported lag
+  rows = pipeline.execute('SELECT sum(lag) FROM pipeline_kafka.consumer_lag')
+  assert rows
+  assert rows[0][0] == 0
+
+  # Now only start one consumer back up
+  pipeline.consume_begin('lag_topic0', 'stream0')
+
+  producer = kafka.get_producer('lag_topic0')
+  for n in range(100):
+    producer.produce(str(n), partition_key=str(n))
+
+  producer = kafka.get_producer('lag_topic1')
+  for n in range(100):
+    producer.produce(str(n), partition_key=str(n))
+
+  def counts1():
+    rows = pipeline.execute('SELECT count FROM lag0')
+    assert rows[0][0] == 200
+
+    rows = pipeline.execute('SELECT count FROM lag1')
+    assert rows[0][0] == 100
+
+  assert eventually(counts1)
+
+  # lag_topic0 should have no lag
+  rows = pipeline.execute("SELECT sum(lag) FROM pipeline_kafka.consumer_lag WHERE topic = 'lag_topic0'")
+  assert rows
+  assert rows[0][0] == 0
+
+  # lag_topic1 should have lag now since we didn't start its consumer
+  rows = pipeline.execute("SELECT sum(lag) FROM pipeline_kafka.consumer_lag WHERE topic = 'lag_topic1'")
+  assert rows
+  assert rows[0][0] == 100
+
+  pipeline.consume_end()
