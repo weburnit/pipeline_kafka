@@ -359,8 +359,6 @@ def test_produce(pipeline, kafka, clean_db):
     assert len(rows) == 100
 
   assert eventually(messages)
-  pdb0.destroy()
-  pdb1.destroy()
 
 
 def test_lag(pipeline, kafka, clean_db):
