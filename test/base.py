@@ -437,7 +437,7 @@ def clean_db(request):
   request.addfinalizer(pdb.drop_all)
   request.addfinalizer(pdb.consume_end)
 
-  pdb.execute('DROP EXTENSION pipeline_kafka')
+  pdb.execute('DROP EXTENSION pipeline_kafka CASCADE')
   pdb.execute('CREATE EXTENSION pipeline_kafka')
   pdb.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
   pdb.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
