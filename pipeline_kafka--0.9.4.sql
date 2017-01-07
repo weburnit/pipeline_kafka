@@ -120,3 +120,14 @@ CREATE FUNCTION pipeline_kafka.consume_end_stream_partitioned (
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_end_stream_partitioned'
 LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION pipeline_kafka.topic_watermarks (topic text, partition integer)
+RETURNS TABLE (partition integer, low_watermark bigint, high_watermark bigint)
+AS 'MODULE_PATHNAME', 'kafka_topic_watermarks'
+LANGUAGE C IMMUTABLE;
+
+CREATE VIEW pipeline_kafka.consumer_lag AS
+SELECT c.id AS consumer_id, c.group_id, c.topic, o.partition, o.offset + 1 AS offset, w.high_watermark,
+w.high_watermark - ("offset" + 1) AS lag FROM pipeline_kafka.consumers c
+  JOIN pipeline_kafka.offsets o ON c.id = o.consumer_id
+  JOIN pipeline_kafka.topic_watermarks(c.topic, o.partition) w ON w.partition = o.partition;

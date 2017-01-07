@@ -14,6 +14,8 @@
 
 #include "postgres.h"
 
+#include "funcapi.h"
+
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
@@ -716,7 +718,6 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 						CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(err));
 			}
 		}
-		return;
 	}
 
 	offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
@@ -2356,4 +2357,83 @@ kafka_consume_end_stream_partitioned(PG_FUNCTION_ARGS)
 
 	relinfo_close(consumers, NoLock);
 	RETURN_SUCCESS();
+}
+
+/*
+ * kafka_topic_watermarks
+ */
+PG_FUNCTION_INFO_V1(kafka_topic_watermarks);
+Datum
+kafka_topic_watermarks(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	rd_kafka_conf_t *conf;
+	text *topic = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
+	int partition;
+	rd_kafka_t *kafka;
+	char err_msg[512];
+	int64_t low;
+	int64_t high;
+	char *topic_name;
+	ListCell *lc;
+	Datum values[3];
+	bool nulls[3];
+	HeapTuple tup;
+	Datum result;
+
+	if (topic == NULL)
+		elog(ERROR, "topic must not be null");
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "partition must not be null");
+
+	partition = PG_GETARG_INT32(1);
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc	tupdesc;
+
+		/* create a function context for cross-call persistence */
+		funcctx = SRF_FIRSTCALL_INIT();
+
+		/* build tupdesc for result tuples */
+		tupdesc = CreateTemplateTupleDesc(3, false);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "partition", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "low_watermark", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "high_watermark", INT8OID, -1, 0);
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		topic_name = TextDatumGetCString(topic);
+		conf = rd_kafka_conf_new();
+
+		if (broker_version)
+			rd_kafka_conf_set(conf, "broker.version.fallback", broker_version, NULL, 0);
+
+		kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
+
+		foreach(lc, get_all_brokers())
+			rd_kafka_brokers_add(kafka, lfirst(lc));
+
+		if (rd_kafka_query_watermark_offsets(kafka, topic_name,
+				partition, &low, &high, KAFKA_META_TIMEOUT) != RD_KAFKA_RESP_ERR_NO_ERROR)
+			elog(ERROR, "failed to retrieve watermark offsets for partition %d", partition);
+
+		rd_kafka_consumer_close(kafka);
+		rd_kafka_destroy(kafka);
+		rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[0] = Int32GetDatum(partition);
+		values[1] = Int64GetDatum(low);
+		values[2] = Int64GetDatum(high);
+
+		tup = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		result = HeapTupleGetDatum(tup);
+		SRF_RETURN_NEXT(funcctx, result);
+	}
+
+	funcctx = (FuncCallContext *) fcinfo->flinfo->fn_extra;
+	SRF_RETURN_DONE(funcctx);
 }
