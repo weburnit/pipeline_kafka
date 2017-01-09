@@ -563,7 +563,9 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 			}
 		}
 		else
+		{
 			offset = start_offset;
+		}
 
 		consumer->offsets[partition] = DatumGetInt64(offset);
 	}
@@ -798,6 +800,9 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 		values[OFFSETS_ATTR_OFFSET - 1] = Int64GetDatum(consumer->offsets[partition]);
 		replace[OFFSETS_ATTR_OFFSET - 1] = true;
 
+		if (consumer->offsets[partition] == RD_KAFKA_OFFSET_NULL)
+			replace[OFFSETS_ATTR_OFFSET - 1] = false;
+
 		modified = heap_modify_tuple(tup, RelationGetDescr(offsets->ri_RelationDesc), values, nulls, replace);
 		relinfo_update(offsets, &modified->t_self, modified);
 	}
@@ -818,6 +823,9 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 		values[OFFSETS_ATTR_OFFSET - 1] = Int64GetDatum(consumer->offsets[partition]);
 
 		MemSet(nulls, false, sizeof(nulls));
+
+		if (consumer->offsets[partition] == RD_KAFKA_OFFSET_NULL)
+			nulls[OFFSETS_ATTR_OFFSET - 1] = true;
 
 		tup = heap_form_tuple(RelationGetDescr(offsets->ri_RelationDesc), values, nulls);
 		relinfo_insert(offsets, tup);

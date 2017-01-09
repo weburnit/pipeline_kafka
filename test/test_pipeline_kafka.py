@@ -648,3 +648,24 @@ def test_lag(pipeline, kafka, clean_db):
   assert rows[0][0] == 100
 
   pipeline.consume_end()
+
+
+def test_null_offsets(pipeline, kafka, clean_db):
+  """
+  Verify that offsets are stored as NULL if a consumer hasn't consumed any messages yet
+  """
+  kafka.create_topic('null_topic', partitions=4)
+  pipeline.create_stream('null_stream', x='integer')
+  pipeline.create_cv('null0', 'SELECT count(*) FROM null_stream')
+
+  pipeline.consume_begin('null_topic', 'null_stream', group_id='null_offsets')
+
+  # Write to a single partition so that only one partition's offsets are updated
+  producer = kafka.get_producer('null_topic')
+  producer.produce('1', partition_key='key')
+
+  time.sleep(10)
+  pipeline.consume_end()
+
+  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets WHERE "offset" IS NULL')
+  assert len(rows) == 3
