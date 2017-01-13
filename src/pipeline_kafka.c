@@ -2597,3 +2597,33 @@ kafka_topic_watermarks(PG_FUNCTION_ARGS)
 	funcctx = (FuncCallContext *) fcinfo->flinfo->fn_extra;
 	SRF_RETURN_DONE(funcctx);
 }
+
+/*
+ * kafka_consumer_has_group_lock
+ */
+PG_FUNCTION_INFO_V1(kafka_consumer_has_group_lock);
+Datum
+kafka_consumer_has_group_lock(PG_FUNCTION_ARGS)
+{
+	int32 consumer_id;
+	KafkaConsumerGroupKey key;
+	KafkaConsumerGroup *group;
+	bool result;
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "consumer_id is null");
+
+	Assert(consumer_groups);
+
+	consumer_id = PG_GETARG_INT32(0);
+	key.db = MyDatabaseId;
+	key.consumer_id = consumer_id;
+	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_FIND, NULL);
+
+	if (!group)
+		PG_RETURN_BOOL(false);
+
+	result = get_lock_flag(group);
+
+	PG_RETURN_BOOL(result);
+}
