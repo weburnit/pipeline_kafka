@@ -1957,7 +1957,6 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 
 	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
 	{
-		pfree(format);
 		format = (text *) CStringGetTextDatum(FORMAT_CSV);
 		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
 		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
