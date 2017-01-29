@@ -2738,7 +2738,8 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 	 * Now wait a reasonable amount of time for other primary consumers to start
 	 * before blowing away our ZK session data.
 	 */
-	while (!TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout))
+	start = GetCurrentTimestamp();
+	while (!TimestampDifferenceExceeds(start, GetCurrentTimestamp(), zookeeper_session_timeout))
 	{
 		int count = 0;
 
@@ -2761,6 +2762,8 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 
 		pg_usleep(1 * 1000 * 100);
 	}
+
+	zk_close();
 
 	/*
 	 * Finally, launch the actual consumers
