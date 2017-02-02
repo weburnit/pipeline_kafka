@@ -2771,6 +2771,7 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 	for (i = 0; i < num_shards; i++)
 	{
 		bool defer_lock = true;
+		Datum result;
 
 		if (primary_shard == i)
 			defer_lock = false;
@@ -2797,8 +2798,12 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 		fcinfo->argnull[13] = false;
 		fcinfo->argnull[14] = false;
 
-		kafka_consume_begin(fcinfo);
+		result = kafka_consume_begin(fcinfo);
+		elog(LOG, "%s launching shard %d consumer", TextDatumGetCString(result), i);
+
+		if (pg_strcasecmp(TextDatumGetCString(result), "success") != 0)
+			RETURN_FAILURE();
 	}
 
-	PG_RETURN_NULL();
+	RETURN_SUCCESS();
 }
