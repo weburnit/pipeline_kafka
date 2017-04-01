@@ -1015,7 +1015,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 
 typedef struct
 {
-	char *stream;
+	char stream[NAMEDATALEN];
 	CopyStmt *copy;
 	StringInfo buf;
 	int num_messages;
@@ -1058,7 +1058,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
 
-	ctl.keysize = sizeof(char *);
+	ctl.keysize = NAMEDATALEN;
 	ctl.entrysize = sizeof(per_stream_state);
 	ctl.hcxt = CacheMemoryContext;
 
@@ -1126,7 +1126,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 
 						old = MemoryContextSwitchTo(CacheMemoryContext);
 
-						state->stream = pstrdup(key);
+						memcpy(state->stream, key, strlen(key));
 						state->buf = makeStringInfo();
 						state->num_messages = 0;
 
@@ -1142,9 +1142,8 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 						MemoryContext old;
 						List *name_list;
 
-						name_list = textToQualifiedNameList(cstring_to_text(key));
-
 						old = MemoryContextSwitchTo(CacheMemoryContext);
+						name_list = textToQualifiedNameList(cstring_to_text(key));
 
 						consumer->rel = makeRangeVarFromNameList(name_list);
 
