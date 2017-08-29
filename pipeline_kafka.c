@@ -805,24 +805,27 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 static CopyStmt *
 get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 {
-	MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
-	CopyStmt *stmt = makeNode(CopyStmt);
+	MemoryContext old;
+	CopyStmt *stmt;
 	Relation rel;
 	TupleDesc desc;
-	DefElem *format = makeNode(DefElem);
+	DefElem *format;
 	int i;
 
-	stmt->relation = consumer->rel;
+	rel = heap_openrv_extended(consumer->rel, AccessShareLock, missing_ok);
+	if (!rel)
+		return NULL;
+
+	old = MemoryContextSwitchTo(CacheMemoryContext);
+	stmt = makeNode(CopyStmt);
+	stmt->relation = copyObject(consumer->rel);
 	stmt->filename = NULL;
 	stmt->options = NIL;
 	stmt->is_from = true;
 	stmt->query = NULL;
 	stmt->attlist = NIL;
 
-	rel = heap_openrv_extended(consumer->rel, AccessShareLock, missing_ok);
-	if (!rel)
-		return NULL;
-
+	format = makeNode(DefElem);
 	desc = RelationGetDescr(rel);
 
 	for (i = 0; i < desc->natts; i++)
@@ -1139,21 +1142,15 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 					 */
 					if (!state->copy)
 					{
-						MemoryContext old;
 						List *name_list;
 
-						old = MemoryContextSwitchTo(CacheMemoryContext);
-						name_list = textToQualifiedNameList(cstring_to_text(key));
-
-						consumer->rel = makeRangeVarFromNameList(name_list);
-
 						StartTransactionCommand();
+						name_list = textToQualifiedNameList(cstring_to_text(key));
+						consumer->rel = makeRangeVarFromNameList(name_list);
 						state->copy = get_copy_statement(consumer, true);
 						CommitTransactionCommand();
 
 						consumer->rel = NULL;
-
-						MemoryContextSwitchTo(old);
 					}
 
 					if (!state->copy)
