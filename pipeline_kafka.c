@@ -887,6 +887,16 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 
 	StartTransactionCommand();
 
+	/*
+	 * We only store offsets if we're not part of a consumer group.
+	 * Consumer groups store their offsets in Kafka.
+	 */
+	save_consumer_offsets(consumer, proc->partition_group);
+
+	CommitTransactionCommand();
+	StartTransactionCommand();
+
+
 	/* we don't want to die in the event of any errors */
 	PG_TRY();
 	{
@@ -908,12 +918,6 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 
 	if (!IsTransactionState())
 		StartTransactionCommand();
-
-	/*
-	 * We only store offsets if we're not part of a consumer group.
-	 * Consumer groups store their offsets in Kafka.
-	 */
-	save_consumer_offsets(consumer, proc->partition_group);
 
 	CommitTransactionCommand();
 
