@@ -1175,6 +1175,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 						Assert(message->offset >= consumer->offsets[partition]);
 						consumer->offsets[partition] = message->offset;
 					}
+					pfree(key);
 				}
 
 				rd_kafka_message_destroy(message);
