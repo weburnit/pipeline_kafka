@@ -767,6 +767,7 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 
 		modified = heap_modify_tuple(tup, RelationGetDescr(offsets->ri_RelationDesc), values, nulls, replace);
 		relinfo_update(offsets, &modified->t_self, modified);
+		CommandCounterIncrement();
 	}
 
 	index_endscan(scan);
