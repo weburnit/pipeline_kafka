@@ -251,10 +251,33 @@ static HTAB *consumer_groups = NULL;
 /* Shared-memory hashtable storing all individual consumer process information */
 static HTAB *consumer_procs = NULL;
 
+typedef struct ConsumerProcsLock
+{
+	LWLock lock;
+	LWLockTranche tranche;
+	int tranch_id;
+} ConsumerProcsLock;
+
+static ConsumerProcsLock *consumer_proc_lock = NULL;
+
 static void
 pipeline_kafka_shmem_startup(void)
 {
 	HASHCTL ctl;
+	bool found;
+
+	consumer_proc_lock = (ConsumerProcsLock *) ShmemInitStruct("NodeMetaState", sizeof(ConsumerProcsLock), &found);
+
+	if (!found)
+	{
+		consumer_proc_lock->tranch_id = LWLockNewTrancheId();
+		consumer_proc_lock->tranche.name = "ConsumerProcsLock";
+		consumer_proc_lock->tranche.array_base = &consumer_proc_lock->lock;
+		consumer_proc_lock->tranche.array_stride = sizeof(ConsumerProcsLock);
+		LWLockInitialize(&consumer_proc_lock->lock, consumer_proc_lock->tranch_id);
+	}
+
+	LWLockRegisterTranche(consumer_proc_lock->tranch_id, &consumer_proc_lock->tranche);
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -1262,7 +1285,7 @@ kafka_consume_main(Datum arg)
 	bool found;
 	int32 id = DatumGetInt32(arg);
 	ListCell *lc;
-	KafkaConsumerProc *proc = hash_search(consumer_procs, &id, HASH_FIND, &found);
+	KafkaConsumerProc *proc;
 	KafkaConsumer consumer;
 	int valid_brokers = 0;
 	int i;
@@ -1270,6 +1293,10 @@ kafka_consume_main(Datum arg)
 	MemoryContext work_ctx;
 	char errstr[512];
 	char val[64];
+
+	LWLockAcquire(&consumer_proc_lock->lock, LW_SHARED);
+	proc = hash_search(consumer_procs, &id, HASH_FIND, &found);
+	LWLockRelease(&consumer_proc_lock->lock);
 
 	MemSet(&consumer, 0, sizeof(KafkaConsumer));
 	MemSet(&topic_meta, 0, sizeof(struct rd_kafka_metadata_topic));
@@ -1615,6 +1642,8 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 	key.db = MyDatabaseId;
 	key.consumer_id = consumer->id;
 
+	LWLockAcquire(&consumer_proc_lock->lock, LW_SHARED);
+
 	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_ENTER, &found);
 	if (found)
 	{
@@ -1634,6 +1663,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		{
 			elog(WARNING, "%s is already being consumed into relation %s",
 					consumer->topic_name, consumer->rel ? consumer->rel->relname : "*");
+			LWLockRelease(&consumer_proc_lock->lock);
 			return true;
 		}
 
@@ -1675,10 +1705,15 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 				consumer->rel ? consumer->rel->relname : "*", consumer->topic_name);
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+		{
+			LWLockRelease(&consumer_proc_lock->lock);
 			return false;
+		}
 
 		proc->worker = *handle;
 	}
+
+	LWLockRelease(&consumer_proc_lock->lock);
 
 	return true;
 }
@@ -1925,11 +1960,13 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 		ids = lappend_int(ids, proc->id);
 	}
 
+	LWLockAcquire(&consumer_proc_lock->lock, LW_EXCLUSIVE);
 	foreach(lc, ids)
 	{
 		int32 id = lfirst_int(lc);
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
+	LWLockRelease(&consumer_proc_lock->lock);
 
 	RETURN_SUCCESS();
 }
