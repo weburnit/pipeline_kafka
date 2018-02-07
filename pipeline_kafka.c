@@ -1945,6 +1945,7 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 	key.db = MyDatabaseId;
 
 	check_pipeline_kafka_preloaded();
+	LWLockAcquire(&consumer_proc_lock->lock, LW_EXCLUSIVE);
 
 	hash_seq_init(&iter, consumer_procs);
 	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
@@ -1960,7 +1961,6 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 		ids = lappend_int(ids, proc->id);
 	}
 
-	LWLockAcquire(&consumer_proc_lock->lock, LW_EXCLUSIVE);
 	foreach(lc, ids)
 	{
 		int32 id = lfirst_int(lc);
