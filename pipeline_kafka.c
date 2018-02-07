@@ -1642,7 +1642,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 	key.db = MyDatabaseId;
 	key.consumer_id = consumer->id;
 
-	LWLockAcquire(&consumer_proc_lock->lock, LW_SHARED);
+	LWLockAcquire(&consumer_proc_lock->lock, LW_EXCLUSIVE);
 
 	group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_ENTER, &found);
 	if (found)
