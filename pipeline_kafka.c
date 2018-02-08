@@ -1102,6 +1102,14 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 		char *librdkerrs;
 		int messages_buffered = 0;
 		Size bytes_buffered = 0;
+		bool found;
+
+		hash_search(consumer_procs, &proc->id, HASH_FIND, &found);
+		if (!found)
+		{
+			elog(WARNING, "consumer %d not found in process table, exiting", proc->id);
+			break;
+		}
 
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
