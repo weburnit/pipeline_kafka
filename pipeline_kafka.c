@@ -1104,7 +1104,10 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 		Size bytes_buffered = 0;
 		bool found;
 
+		LWLockAcquire(&consumer_proc_lock->lock, LW_SHARED);
 		hash_search(consumer_procs, &proc->id, HASH_FIND, &found);
+		LWLockRelease(&consumer_proc_lock->lock);
+
 		if (!found)
 		{
 			elog(WARNING, "consumer %d not found in process table, exiting", proc->id);
