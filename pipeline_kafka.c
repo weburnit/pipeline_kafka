@@ -88,7 +88,7 @@ PG_MODULE_MAGIC;
 #define BROKER_RELATION_NATTS	1
 #define BROKER_ATTR_HOST 		1
 
-#define NUM_CONSUMERS_INIT 4
+#define NUM_CONSUMERS_INIT 1024
 #define NUM_CONSUMERS_MAX 1024
 
 #define DEFAULT_PARALLELISM 1
@@ -266,7 +266,7 @@ pipeline_kafka_shmem_startup(void)
 	HASHCTL ctl;
 	bool found;
 
-	consumer_proc_lock = (ConsumerProcsLock *) ShmemInitStruct("NodeMetaState", sizeof(ConsumerProcsLock), &found);
+	consumer_proc_lock = (ConsumerProcsLock *) ShmemInitStruct("ConsumerProcsState", sizeof(ConsumerProcsLock), &found);
 
 	if (!found)
 	{
@@ -1461,7 +1461,6 @@ kafka_consume_main(Datum arg)
 		consume_topic_stream_partitioned(&consumer, proc, consumer.topic);
 
 done:
-	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 
 	for (i = 0; i < topic_meta.partition_cnt; i++)
 	{
@@ -1966,6 +1965,7 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 		int32 id = lfirst_int(lc);
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
+
 	LWLockRelease(&consumer_proc_lock->lock);
 
 	RETURN_SUCCESS();
