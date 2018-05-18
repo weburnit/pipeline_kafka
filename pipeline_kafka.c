@@ -94,8 +94,6 @@ PG_MODULE_MAGIC;
 #define DEFAULT_PARALLELISM 1
 #define MAX_CONSUMER_PROCS 32
 
-#define KAFKA_META_TIMEOUT 1000 /* 1s */
-
 #define OPTION_DELIMITER "delimiter"
 #define OPTION_FORMAT "format"
 #define FORMAT_CSV "csv"
@@ -118,6 +116,7 @@ static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static char *broker_version = NULL;
 static char *consumer_config = NULL;
+static int meta_timeout;
 
 void _PG_init(void);
 
@@ -329,6 +328,14 @@ _PG_init(void)
 			&consumer_config,
 			NULL,
 			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pipeline_kafka.metadata_timeout",
+			gettext_noop("Timeout to use when retrieving topic metadata."),
+			NULL,
+			&meta_timeout,
+			1000, 0, INT_MAX,
+			PGC_USERSET, 0,
 			NULL, NULL, NULL);
 
 	prev_shmem_startup_hook = shmem_startup_hook;
@@ -1352,7 +1359,7 @@ kafka_consume_main(Datum arg)
 	 * Set up our topic to read from
 	 */
 	consumer.topic = rd_kafka_topic_new(consumer.kafka, consumer.topic_name, topic_conf);
-	err = rd_kafka_metadata(consumer.kafka, false, consumer.topic, &meta, KAFKA_META_TIMEOUT);
+	err = rd_kafka_metadata(consumer.kafka, false, consumer.topic, &meta, meta_timeout);
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
 		elog(ERROR, CONSUMER_LOG_PREFIX "failed to acquire metadata: %s",
@@ -1455,7 +1462,7 @@ done:
 
 		rd_kafka_consumer_close(consumer.kafka);
 		rd_kafka_destroy(consumer.kafka);
-		rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+		rd_kafka_wait_destroyed(meta_timeout);
 	}
 }
 
@@ -2080,7 +2087,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		if (valid_brokers == 0)
 		{
 			rd_kafka_destroy(kafka);
-			rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+			rd_kafka_wait_destroyed(meta_timeout);
 			elog(ERROR, "no valid brokers were found");
 		}
 
@@ -2419,12 +2426,12 @@ kafka_topic_watermarks(PG_FUNCTION_ARGS)
 			rd_kafka_brokers_add(kafka, lfirst(lc));
 
 		if (rd_kafka_query_watermark_offsets(kafka, topic_name,
-				partition, &low, &high, KAFKA_META_TIMEOUT) != RD_KAFKA_RESP_ERR_NO_ERROR)
+				partition, &low, &high, meta_timeout) != RD_KAFKA_RESP_ERR_NO_ERROR)
 			elog(ERROR, "failed to retrieve watermark offsets for partition %d", partition);
 
 		rd_kafka_consumer_close(kafka);
 		rd_kafka_destroy(kafka);
-		rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
+		rd_kafka_wait_destroyed(meta_timeout);
 
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, false, sizeof(nulls));
