@@ -47,6 +47,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -1353,8 +1354,12 @@ kafka_consume_main(Datum arg)
 	/* we're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
+#if (PG_VERSION_NUM < 110000)
 	/* give this proc access to the database */
+	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
+#else
 	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid, 0);
+#endif
 
 	/* set up error buffer */
 	error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
