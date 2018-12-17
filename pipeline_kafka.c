@@ -10,12 +10,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <execinfo.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "postgres.h"
 
 #include "funcapi.h"
-
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
@@ -23,21 +24,22 @@
 #include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
-#include "catalog/pipeline_stream_fn.h"
-#include "executor/executor.h"
-#include "executor/spi.h"
+#include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/dbcommands.h"
-#include "commands/sequence.h"
-#include "catalog/pg_type.h"
 #include "commands/trigger.h"
+#include "commands/sequence.h"
+#include "config.h"
+#include "copy.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "librdkafka/rdkafka.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/print.h"
 #include "pipeline_kafka.h"
-#include "pipeline/stream.h"
+#include "pipeline_stream.h"
 #include "port/atomics.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -53,6 +55,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
 
@@ -190,6 +193,12 @@ error_buf_pop(error_buf_t *ebuf)
 	return err;
 }
 
+typedef struct ShmemBackgroundWorkerHandle
+{
+	int	 slot;
+	uint64 generation;
+} ShmemBackgroundWorkerHandle;
+
 /*
  * Shared-memory state for each consumer process
  */
@@ -200,7 +209,9 @@ typedef struct KafkaConsumerProc
 	int32 consumer_id;
 	int64 start_offset;
 	int partition_group;
-	BackgroundWorkerHandle worker;
+	int worker_slot;
+	uint64 worker_generation;
+	ShmemBackgroundWorkerHandle worker;
 } KafkaConsumerProc;
 
 typedef struct KafkaConsumerGroupKey
@@ -249,6 +260,33 @@ static HTAB *consumer_groups = NULL;
 
 /* Shared-memory hashtable storing all individual consumer process information */
 static HTAB *consumer_procs = NULL;
+
+static void
+debug_segfault(SIGNAL_ARGS)
+{
+	void *array[32];
+	size_t size = backtrace(array, 32);
+	fprintf(stderr, "Segmentation fault (PID %d)\n", MyProcPid);
+	fprintf(stderr, "PostgreSQL version: %s\n", PG_VERSION);
+	fprintf(stderr, "PipelineDB version: %s at revision %s\n", pipeline_version_str, pipeline_revision_str);
+	fprintf(stderr, "backtrace:\n");
+	backtrace_symbols_fd(array, size, STDERR_FILENO);
+
+#ifdef SLEEP_ON_ASSERT
+
+	/*
+	 * It would be nice to use pg_usleep() here, but only does 2000 sec or 33
+	 * minutes, which seems too short.
+	 */
+	sleep(1000000);
+#endif
+
+#ifdef DUMP_CORE
+	abort();
+#else
+	exit(1);
+#endif
+}
 
 static void
 pipeline_kafka_shmem_startup(void)
@@ -342,6 +380,17 @@ _PG_init(void)
 	shmem_startup_hook = pipeline_kafka_shmem_startup;
 
 	RequestAddinShmemSpace(MAXALIGN(pipeline_kafka_shmem_size()));
+}
+
+/*
+ * terminate_bgworker
+ */
+static void
+terminate_bgworker(ShmemBackgroundWorkerHandle *handle)
+{
+	BackgroundWorkerHandle *h = (BackgroundWorkerHandle *) handle;
+
+	TerminateBackgroundWorker(h);
 }
 
 /*
@@ -666,30 +715,6 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 }
 
 /*
- * copy_next
- */
-static int
-copy_next(void *args, void *buf, int minread, int maxread)
-{
-	StringInfo messages = (StringInfo) args;
-	int remaining = messages->len - messages->cursor;
-	int read = 0;
-
-	if (maxread <= remaining)
-		read = maxread;
-	else
-		read = remaining;
-
-	if (read == 0)
-		return 0;
-
-	memcpy(buf, messages->data + messages->cursor, read);
-	messages->cursor += read;
-
-	return read;
-}
-
-/*
  * save_consumer_offsets
  */
 static void
@@ -842,8 +867,8 @@ get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 		 * Users can't supply values for arrival_timestamp, so make
 		 * sure we exclude it from the copy attr list
 		 */
-		char *name = pstrdup(NameStr(desc->attrs[i]->attname));
-		if (IsStream(RelationGetRelid(rel)) && pg_strcasecmp(name, ARRIVAL_TIMESTAMP) == 0)
+		char *name = pstrdup(NameStr(TupleDescAttr(desc, i)->attname));
+		if (RelidIsStream(RelationGetRelid(rel)) && pg_strcasecmp(name, ARRIVAL_TIMESTAMP) == 0)
 			continue;
 		stmt->attlist = lappend(stmt->attlist, makeString(name));
 	}
@@ -883,24 +908,50 @@ get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 	return stmt;
 }
 
+static StringInfo copy_buf = NULL;
+
 /*
  * execute_copy
  *
  * Write messages to stream
  */
+static int
+copy_iter_hook(void *outbuf, int minread, int maxread)
+{
+	int remaining = copy_buf->len - copy_buf->cursor;
+	int read = 0;
+
+	if (maxread <= remaining)
+		read = maxread;
+	else
+		read = remaining;
+
+	if (read == 0)
+		return 0;
+
+	memcpy(outbuf, copy_buf->data + copy_buf->cursor, read);
+	copy_buf->cursor += read;
+
+	return read;
+}
+
 static void
 execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, StringInfo buf, int num_messages)
 {
 	MemoryContext old = CurrentMemoryContext;
+	ParseState *pstate;
+	uint64 processed;
 
 	StartTransactionCommand();
+
+	/* Set the buffer that our COPY hook will read from */
+	copy_buf = buf;
 
 	/* we don't want to die in the event of any errors */
 	PG_TRY();
 	{
-		uint64 processed;
-		copy_iter_arg = buf;
-		DoCopy(stmt, "COPY", &processed);
+		pstate = make_parsestate(NULL);
+		DoStreamCopy(pstate, (CopyStmt *) stmt,  -1, -1, &processed);
 	}
 	PG_CATCH();
 	{
@@ -1303,7 +1354,7 @@ kafka_consume_main(Datum arg)
 	BackgroundWorkerUnblockSignals();
 
 	/* give this proc access to the database */
-	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
+	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid, 0);
 
 	/* set up error buffer */
 	error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
@@ -1407,7 +1458,7 @@ kafka_consume_main(Datum arg)
 
 		if (rd_kafka_consume_start(consumer.topic, partition, start_offset) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
-					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
+					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_last_error()));
 
 		my_partitions++;
 	}
@@ -1426,7 +1477,7 @@ kafka_consume_main(Datum arg)
 	}
 
 	/* set copy hook */
-	copy_iter_hook = copy_next;
+	stream_copy_hook = copy_iter_hook;
 
 	work_ctx = AllocSetContextCreate(TopMemoryContext, "KafkaConsumerContext",
 				ALLOCSET_DEFAULT_MINSIZE,
@@ -1549,7 +1600,7 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 		values[CONSUMER_ATTR_TOPIC - 1] = PointerGetDatum(topic);
 
 		seqrel = heap_openrv(get_rangevar("consumers_id_seq"), AccessShareLock);
-		consumer_id = nextval_internal(RelationGetRelid(seqrel));
+		consumer_id = nextval_internal(RelationGetRelid(seqrel), true);
 		heap_close(seqrel, NoLock);
 		values[CONSUMER_ATTR_ID -1] = Int32GetDatum(consumer_id);
 
@@ -1672,7 +1723,6 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		worker.bgw_flags = BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_SHMEM_ACCESS;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 		worker.bgw_restart_time = CONSUMER_WORKER_RESTART_TIME;
-		worker.bgw_main = NULL;
 		worker.bgw_notify_pid = 0;
 
 		/* this module is loaded dynamically, so we can't use bgw_main */
@@ -1684,7 +1734,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 			return false;
 
-		proc->worker = *handle;
+		memcpy(&proc->worker, handle, sizeof(ShmemBackgroundWorkerHandle));
 	}
 
 	return true;
@@ -1853,7 +1903,7 @@ kafka_consume_end(PG_FUNCTION_ARGS)
 		if (proc->consumer_id != id && proc->db == MyDatabaseId)
 			continue;
 
-		TerminateBackgroundWorker(&proc->worker);
+		terminate_bgworker(&proc->worker);
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
 
@@ -1924,7 +1974,7 @@ kafka_consume_end_all(PG_FUNCTION_ARGS)
 		if (proc->db != MyDatabaseId)
 			continue;
 
-		TerminateBackgroundWorker(&proc->worker);
+		terminate_bgworker(&proc->worker);
 
 		key.consumer_id = proc->consumer_id;
 		hash_search(consumer_groups, &key, HASH_REMOVE, NULL);
@@ -2123,7 +2173,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 
 	if (rd_kafka_produce(topic, partition, RD_KAFKA_MSG_F_COPY, VARDATA_ANY(msg), VARSIZE_ANY_EXHDR(msg),
 			key, keylen, NULL) == -1)
-		elog(ERROR, "failed to produce message (size %ld): %s", VARSIZE_ANY_EXHDR(msg), rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		elog(ERROR, "failed to produce message (size %ld): %s", VARSIZE_ANY_EXHDR(msg), rd_kafka_err2str(rd_kafka_last_error()));
 
 	rd_kafka_poll(MyKafka, 0);
 
@@ -2362,7 +2412,7 @@ kafka_consume_end_stream_partitioned(PG_FUNCTION_ARGS)
 		if (proc->consumer_id != id && proc->db == MyDatabaseId)
 			continue;
 
-		TerminateBackgroundWorker(&proc->worker);
+		terminate_bgworker(&proc->worker);
 		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 	}
 

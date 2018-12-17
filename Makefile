@@ -2,11 +2,13 @@ MODULE_big = pipeline_kafka
 OBJS = pipeline_kafka.o
 
 EXTENSION = pipeline_kafka
-DATA = pipeline_kafka--0.9.3.sql
+DATA = pipeline_kafka--1.0.0.sql
 
 REGRESS = pipeline_kafka
 
 LIB_RDKAFKA_STATIC ?= /usr/lib/librdkafka.a
+
+PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server)/../pipelinedb
 
 SHLIB_LINK += $(LIB_RDKAFKA_STATIC)
 SHLIB_LINK += -lz -lpthread -lssl
