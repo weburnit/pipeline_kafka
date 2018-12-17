@@ -4,7 +4,9 @@ PipelineDB extension for Kafka support
 
 ## Requirements
 
-You'll need to have [librdkafka](https://github.com/edenhill/librdkafka) installed on your system to build the extension. The easiest way to install it is to built it from source.
+`pipeline_kafka` runs alongside PipelineDB as an extension, so you'll want to start by having [PipelineDB installed](http://docs.pipelinedb.com/installation.html) on your system.
+
+You'll also need to have [librdkafka](https://github.com/edenhill/librdkafka) installed on your system to build the extension. The easiest way to install it is to built it from source.
 
 ```
 git clone -b v0.11.6 https://github.com/edenhill/librdkafka.git ~/librdkafka
@@ -26,10 +28,10 @@ make
 make install
 ```
 
-`pipeline_kafka` internally uses shared memory to sync state between background workers, so it must be preloaded as a shared library. You can do so by adding the following line to your `pipelinedb.conf` file. If you're already loading some shared libraries, then simply add `pipeline_kafka` as a comma-separated list.
+`pipeline_kafka` internally uses shared memory to sync state between background workers, so it must be preloaded as a shared library. You can do so by adding the following line to your `postgresql.conf` file. If you're already loading some shared libraries, then simply add `pipeline_kafka` as a comma-separated list.
 
 ```
-shared_preload_libraries = 'pipeline_kafka'
+shared_preload_libraries = 'pipelinedb,pipeline_kafka'
 ```
 
 Now you can load the extension into a database:
