@@ -2,7 +2,7 @@ PipelineDB extension for Kafka support
 
 ## Requirements
 
-`pipeline_kafka` runs alongside PipelineDB as an extension, so you'll want to start by having [PipelineDB installed](http://docs.pipelinedb.com/installation.html) on your system.
+`pipeline_kafka` runs alongside [PipelineDB](https://www.pipelinedb.com/) as an extension, so you'll want to start by having [PipelineDB installed](http://docs.pipelinedb.com/installation.html) on your system.
 
 You'll also need to have [librdkafka](https://github.com/edenhill/librdkafka) installed on your system to build the extension. The easiest way to install it is to built it from source.
 
