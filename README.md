@@ -7,7 +7,7 @@ PipelineDB extension for Kafka support
 You'll need to have [librdkafka](https://github.com/edenhill/librdkafka) installed on your system to build the extension. The easiest way to install it is to built it from source.
 
 ```
-git clone -b 0.9.1 https://github.com/edenhill/librdkafka.git ~/librdkafka
+git clone -b v0.11.6 https://github.com/edenhill/librdkafka.git ~/librdkafka
 cd ~/librdkafka
 ./configure --prefix=/usr
 make
