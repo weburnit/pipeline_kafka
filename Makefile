@@ -6,12 +6,12 @@ DATA = pipeline_kafka--1.0.0.sql
 
 REGRESS = pipeline_kafka
 
-LIB_RDKAFKA_STATIC ?= /usr/lib/librdkafka.a
+LIB_RDKAFKA_STATIC ?= /usr/lib/x86_64-linux-gnu/librdkafka.a
 
 PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server)/../pipelinedb
 
 SHLIB_LINK += $(LIB_RDKAFKA_STATIC)
-SHLIB_LINK += -lz -lpthread -lssl
+SHLIB_LINK += -z -lpthread -lssl
 
 ifndef NO_PGXS
 PG_CONFIG = pg_config
