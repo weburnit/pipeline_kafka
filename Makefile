@@ -11,7 +11,7 @@ LIB_RDKAFKA_STATIC ?= /usr/lib/x86_64-linux-gnu/librdkafka.a
 PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server)/../pipelinedb
 
 SHLIB_LINK += $(LIB_RDKAFKA_STATIC)
-SHLIB_LINK += -z
+SHLIB_LINK += -z -lpthread -ssl
 
 ifndef NO_PGXS
 PG_CONFIG = pg_config
